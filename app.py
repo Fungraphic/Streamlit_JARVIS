@@ -426,9 +426,11 @@ tab_interface, tab_settings = st.tabs(["🎛️ Interface", "⚙️ Settings"])
 with tab_interface:
     now_ts = time.time()
     last_ts = st.session_state.get("last_assistant_ts", 0.0)
-    recent_assistant = last_ts and (now_ts - last_ts) < 6
-    speaking = bool(recent_assistant)
-    st.session_state.assistant_speaking = speaking
+    speaking = bool(st.session_state.get("assistant_speaking", False))
+
+    if speaking and last_ts and (now_ts - last_ts) >= 6:
+        speaking = False
+        st.session_state.assistant_speaking = False
 
     mode = st.session_state.get("interaction_mode", "chat")
     radar_class = "visualizer speaking" if speaking else "visualizer"
