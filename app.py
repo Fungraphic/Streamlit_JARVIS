@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, io, json, time, subprocess, importlib.util, threading, queue
+import os, io, json, time, subprocess, importlib.util, threading, queue, html
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
@@ -470,14 +470,26 @@ with tab_interface:
         st.markdown('<p class="muted" style="margin-top:8px;">Affichage compact. (Le backend micro/FFT est côté jarvis.py)</p></div>', unsafe_allow_html=True)
     with c2:
         st.markdown('<div class="card"><h3>Chat</h3><div class="chat-wrap">', unsafe_allow_html=True)
-        st.markdown('<div class="msgs">', unsafe_allow_html=True)
         msgs = st.session_state.setdefault("messages", [])
-        for m in msgs:
-            role = m.get("role", "assistant")
-            content = m.get("content", "")
-            cls = "bubble assistant" if role != "user" else "bubble user"
-            st.markdown(f'<div class="{cls}">{content}</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+
+        def _render_messages(messages: List[Dict[str, str]]) -> str:
+            if not messages:
+                return (
+                    '<div class="msgs"><div class="bubble assistant muted">'
+                    "Aucun échange pour le moment."
+                    "</div></div>"
+                )
+
+            bubbles = []
+            for msg in messages:
+                role = msg.get("role", "assistant")
+                content = msg.get("content", "")
+                cls = "bubble assistant" if role != "user" else "bubble user"
+                safe_content = html.escape(str(content)).replace("\n", "<br />")
+                bubbles.append(f'<div class="{cls}">{safe_content}</div>')
+            return f"<div class='msgs'>{''.join(bubbles)}</div>"
+
+        st.markdown(_render_messages(msgs), unsafe_allow_html=True)
 
         cols = st.columns([2, 8, 3])
         with cols[0]:
@@ -524,6 +536,7 @@ with tab_interface:
                     st.session_state["messages"] = msgs
                     st.session_state.last_assistant_ts = time.time()
                     st.session_state.assistant_speaking = True
+                    st.session_state["chat_input"] = ""
                     st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
