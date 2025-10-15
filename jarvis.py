@@ -503,10 +503,16 @@ def init_llm():
             ollama_client = OllamaClient(host=OLLAMA_HOST, timeout=_ollama_timeout)
     except TypeError:
         ollama_client = OllamaClient(host=OLLAMA_HOST)
+
     via = "http" if _OLLAMA_VIA_HTTP else "sdk"
+    try:
+        stream_flag = bool(int(OLLAMA_STREAM))
+    except (TypeError, ValueError):
+        stream_flag = bool(OLLAMA_STREAM)
+
     log(
         "[LLM] Connexion Ollama (%s): host=%s model=%s timeout=%s temp=%.3f ctx=%s stream=%s"
-        % (via, OLLAMA_HOST, LLM_ID, OLLAMA_TIMEOUT, OLLAMA_TEMPERATURE, OLLAMA_NUM_CTX, bool(OLLAMA_STREAM))
+        % (via, OLLAMA_HOST, LLM_ID, OLLAMA_TIMEOUT, OLLAMA_TEMPERATURE, OLLAMA_NUM_CTX, stream_flag)
     )
     return None, None
 
