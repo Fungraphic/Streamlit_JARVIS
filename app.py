@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, io, json, time, subprocess, importlib.util, threading, queue, html, re
+import os, io, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
@@ -38,7 +38,19 @@ DEFAULT_CFG: Dict[str, Any] = {
         "num_ctx": 4096,
         "stream": False,
     },
-    "mcp": {"servers": ["npx -y @modelcontextprotocol/server-filesystem"]},
+    "mcp": {
+        "servers": [
+            {
+                "id": "filesystem",
+                "name": "Filesystem",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+                "env": {},
+                "enabled": True,
+                "auto_start": True,
+            }
+        ]
+    },
     "jarvis": {
         "path": "./jarvis.py",
         "audio_out": "analog",
@@ -52,6 +64,58 @@ DEFAULT_CFG: Dict[str, Any] = {
     },
 }
 
+
+def _normalize_mcp_servers(cfg: Dict[str, Any]) -> None:
+    """Ensure MCP server configs are dict-based and fill defaults."""
+    mcp = cfg.setdefault("mcp", {})
+    servers = mcp.get("servers", []) or []
+    normalized: List[Dict[str, Any]] = []
+    for idx, entry in enumerate(servers):
+        server: Dict[str, Any]
+        if isinstance(entry, str):
+            try:
+                parts = shlex.split(entry)
+            except Exception:
+                parts = entry.split()
+            command = parts[0] if parts else entry.strip()
+            args = parts[1:] if len(parts) > 1 else []
+            server = {
+                "id": f"srv_{idx+1}",
+                "name": command or f"Serveur {idx+1}",
+                "command": command,
+                "args": args,
+                "env": {},
+                "enabled": True,
+                "auto_start": True,
+            }
+        elif isinstance(entry, dict):
+            server = {
+                "id": entry.get("id") or entry.get("name") or f"srv_{idx+1}",
+                "name": entry.get("name") or entry.get("id") or f"Serveur {idx+1}",
+                "command": entry.get("command") or "",
+                "args": entry.get("args") or [],
+                "env": entry.get("env") or {},
+                "enabled": bool(entry.get("enabled", True)),
+                "auto_start": bool(entry.get("auto_start", True)),
+            }
+        else:
+            continue
+        if not server.get("id"):
+            server["id"] = uuid.uuid4().hex[:8]
+        if not isinstance(server.get("args"), list):
+            raw_args = server.get("args")
+            if isinstance(raw_args, str):
+                try:
+                    server["args"] = shlex.split(raw_args)
+                except Exception:
+                    server["args"] = raw_args.split()
+            else:
+                server["args"] = []
+        if not isinstance(server.get("env"), dict):
+            server["env"] = {}
+        normalized.append(server)
+    mcp["servers"] = normalized
+
 def load_cfg() -> Dict[str, Any]:
     try:
         if os.path.exists(CONFIG_PATH):
@@ -64,10 +128,13 @@ def load_cfg() -> Dict[str, Any]:
                         cfg[k] = {**cfg.get(k, {}), **v}
                     else:
                         cfg[k] = v
+                _normalize_mcp_servers(cfg)
                 return cfg
     except Exception as e:
         st.warning(f"Lecture config échouée: {e}")
-    return DEFAULT_CFG.copy()
+    cfg = DEFAULT_CFG.copy()
+    _normalize_mcp_servers(cfg)
+    return cfg
 
 def save_cfg(cfg: Dict[str, Any]):
     try:
@@ -123,6 +190,7 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
         "OLLAMA_TEMPERATURE": str(ollama_cfg.get("temperature", 0.7)),
         "OLLAMA_NUM_CTX": str(ollama_cfg.get("num_ctx", 4096)),
         "OLLAMA_STREAM": "1" if ollama_cfg.get("stream") else "0",
+        "MCP_SERVERS_JSON": json.dumps(cfg.get("mcp", {}).get("servers", []), ensure_ascii=False),
     }
 
     for key, value in env_map.items():
@@ -827,9 +895,105 @@ with tab_settings:
                     st.success("Chargé") if ok else st.error("Échec warm-up")
 
     with t4:
-        servers_str = "\n".join(CFG["mcp"].get("servers", []))
-        new_servers = st.text_area("Serveurs MCP", value=servers_str, height=120)
-        CFG["mcp"]["servers"] = [s.strip() for s in new_servers.splitlines() if s.strip()]
+        st.write("**Serveurs MCP**")
+        servers = CFG.setdefault("mcp", {}).setdefault("servers", [])
+        add_col, _ = st.columns([1, 4])
+        with add_col:
+            if st.button("➕ Ajouter un serveur MCP", key="mcp_add_server"):
+                servers.append(
+                    {
+                        "id": uuid.uuid4().hex[:8],
+                        "name": "Nouveau serveur",
+                        "command": "",
+                        "args": [],
+                        "env": {},
+                        "enabled": True,
+                        "auto_start": True,
+                    }
+                )
+                st.rerun()
+
+        try:
+            import importlib.util as _ilu
+
+            mcp_installed = _ilu.find_spec("mcp") is not None
+        except Exception:
+            mcp_installed = False
+        if not mcp_installed:
+            st.info(
+                "Bibliothèque Python `mcp` introuvable. Installe-la (ex: `pip install modelcontextprotocol`)"
+                " pour permettre la découverte des outils.")
+
+        remove_index: Optional[int] = None
+        if not servers:
+            st.caption("Aucun serveur MCP configuré pour le moment.")
+        for idx, server in enumerate(list(servers)):
+            server_id = server.get("id") or uuid.uuid4().hex[:8]
+            server["id"] = server_id
+            exp = st.expander(f"{server.get('name', 'Serveur MCP')} · {server_id}", expanded=False)
+            with exp:
+                server["enabled"] = st.toggle(
+                    "Activer ce serveur", value=bool(server.get("enabled", True)), key=f"mcp_enabled_{server_id}"
+                )
+                server["auto_start"] = st.toggle(
+                    "Démarrage automatique", value=bool(server.get("auto_start", True)), key=f"mcp_autostart_{server_id}"
+                )
+
+                server["name"] = st.text_input(
+                    "Nom dans l'interface", value=server.get("name", "Serveur MCP"), key=f"mcp_name_{server_id}"
+                )
+                cols = st.columns([2, 3])
+                with cols[0]:
+                    server["command"] = st.text_input(
+                        "Commande", value=server.get("command", ""), key=f"mcp_command_{server_id}"
+                    )
+                with cols[1]:
+                    args_text = st.text_input(
+                        "Arguments", value=" ".join(server.get("args", [])), key=f"mcp_args_{server_id}"
+                    )
+                    if args_text.strip():
+                        try:
+                            server["args"] = shlex.split(args_text)
+                        except Exception:
+                            server["args"] = args_text.split()
+                    else:
+                        server["args"] = []
+
+                env_lines = []
+                env_dict = server.get("env", {}) or {}
+                for k, v in env_dict.items():
+                    env_lines.append(f"{k}={v}")
+                env_text = st.text_area(
+                    "Variables d'environnement (clé=valeur, une par ligne)",
+                    value="\n".join(env_lines),
+                    key=f"mcp_env_{server_id}",
+                    height=100,
+                )
+                env: Dict[str, str] = {}
+                for line in env_text.splitlines():
+                    if not line.strip():
+                        continue
+                    if "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+                server["env"] = env
+
+                cmd_preview = " ".join(
+                    [server.get("command", "").strip()]
+                    + [a for a in server.get("args", []) if a]
+                ).strip()
+                st.caption(f"Commande effective : `{cmd_preview}`")
+
+                if st.button("🗑️ Supprimer ce serveur", key=f"mcp_delete_{server_id}"):
+                    remove_index = idx
+
+        if remove_index is not None:
+            try:
+                del servers[remove_index]
+            except Exception:
+                pass
+            st.rerun()
 
     with t5:
         csa, csb = st.columns(2)
