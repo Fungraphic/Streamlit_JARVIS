@@ -327,6 +327,36 @@ new_logs = drain_jarvis_logs() if st.session_state.jarvis_running else []
 if new_logs:
     _update_speaking_state_from_logs(new_logs)
 
+
+def _ingest_chat_from_logs(logs: List[str]):
+    if not logs:
+        return
+
+    msgs = st.session_state.setdefault("messages", [])
+    changed = False
+
+    for raw in logs:
+        line = (raw or "").strip()
+        if not line:
+            continue
+
+        if line.startswith("[STT] Vous:"):
+            content = line.split(":", 1)[1].strip()
+            if content:
+                msgs.append({"role": "user", "content": content})
+                changed = True
+        elif line.startswith("JARVIS:"):
+            content = line.split(":", 1)[1].strip()
+            if content:
+                msgs.append({"role": "assistant", "content": content})
+                changed = True
+
+    if changed:
+        st.session_state["messages"] = msgs[-200:]
+
+
+_ingest_chat_from_logs(new_logs)
+
 # -------------- CSS --------------
 st.markdown("""
 <style>
