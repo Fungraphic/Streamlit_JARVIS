@@ -7,7 +7,9 @@
 #   # (NVIDIA optionnel pour Piper):  pip install -U onnxruntime-gpu
 #   # Fallback TTS (Linux): sudo apt-get install -y espeak-ng || sudo apt-get install -y espeak
 
-import os, time, threading, queue, tempfile, sys, warnings, logging, shutil, subprocess, re, json, pathlib
+import os, time, threading, queue, tempfile, sys, warnings, logging, shutil, subprocess, re, json, pathlib, asyncio, importlib
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, Tuple
 
 # --- Forcer CPU pour éviter OOM / chargements CUDA accidentels ---
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -84,6 +86,9 @@ except ValueError:
     OLLAMA_NUM_CTX = 4096
 OLLAMA_STREAM = int(os.getenv("OLLAMA_STREAM", "1"))
 
+# MCP configuration (JSON depuis l'UI Streamlit)
+MCP_SERVERS_JSON = os.getenv("MCP_SERVERS_JSON", "[]")
+
 # Wake config
 REQUIRE_WAKE     = int(os.getenv("REQUIRE_WAKE", "1"))
 WAKE_FUZZY       = int(os.getenv("WAKE_FUZZY", "1"))
@@ -120,6 +125,305 @@ def log(msg: str):
     try: q_log.put_nowait(msg)
     except Exception: pass
 
+# ===================== MCP (Model Context Protocol) =====================
+
+def _resolve_mcp_classes() -> Tuple[Optional[type], Optional[type]]:
+    stdio_cls = None
+    session_cls = None
+    stdio_modules = (
+        "mcp.client.stdio",
+        "mcp.client.stdio_client",
+        "modelcontextprotocol.client.stdio",
+        "modelcontextprotocol.client.stdio_client",
+    )
+    session_modules = (
+        "mcp.client.session",
+        "modelcontextprotocol.client.session",
+    )
+
+    for mod_name in stdio_modules:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        candidate = getattr(mod, "StdioClient", None)
+        if candidate is not None:
+            stdio_cls = candidate
+            break
+
+    for mod_name in session_modules:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        candidate = getattr(mod, "ClientSession", None)
+        if candidate is not None:
+            session_cls = candidate
+            break
+
+    return stdio_cls, session_cls
+
+
+MCP_STDIO_CLIENT, MCP_CLIENT_SESSION = _resolve_mcp_classes()
+
+
+@dataclass
+class MCPServerConfig:
+    server_id: str
+    name: str
+    command: str
+    args: List[str] = field(default_factory=list)
+    env: Dict[str, str] = field(default_factory=dict)
+    enabled: bool = True
+    auto_start: bool = True
+
+
+def _create_stdio_client(cfg: MCPServerConfig):
+    if MCP_STDIO_CLIENT is None:
+        raise RuntimeError("Bibliothèque MCP non disponible")
+    env = os.environ.copy()
+    for key, value in (cfg.env or {}).items():
+        if key is None:
+            continue
+        env[str(key)] = str(value)
+    try:
+        return MCP_STDIO_CLIENT(command=cfg.command, args=cfg.args, env=env)
+    except TypeError:
+        try:
+            return MCP_STDIO_CLIENT(cfg.command, cfg.args, env=env)
+        except TypeError:
+            return MCP_STDIO_CLIENT(cfg.command, *cfg.args, env=env)
+
+
+async def _with_mcp_session(cfg: MCPServerConfig, coro):
+    if MCP_CLIENT_SESSION is None or MCP_STDIO_CLIENT is None:
+        raise RuntimeError("Client MCP indisponible")
+    client = _create_stdio_client(cfg)
+    async with client as transport:
+        session = MCP_CLIENT_SESSION(transport)
+        await session.initialize()
+        return await coro(session)
+
+
+def _extract_tools(result: Any) -> List[Dict[str, Any]]:
+    tools: List[Dict[str, Any]] = []
+    if result is None:
+        return tools
+    if isinstance(result, dict):
+        raw = result.get("tools") or result.get("result") or result
+        if isinstance(raw, list):
+            for tool in raw:
+                tools.extend(_extract_tools(tool))
+        return tools
+
+    if isinstance(result, list):
+        for item in result:
+            tools.extend(_extract_tools(item))
+        return tools
+
+    name = getattr(result, "name", None)
+    if not name:
+        maybe = getattr(result, "tool", None)
+        if maybe:
+            return _extract_tools(maybe)
+        return tools
+
+    description = getattr(result, "description", None) or getattr(result, "desc", None)
+    input_schema = getattr(result, "input_schema", None) or getattr(result, "schema", None)
+    if isinstance(result, dict):
+        description = result.get("description", description)
+        input_schema = result.get("input_schema", input_schema)
+    if isinstance(input_schema, (list, tuple)):
+        input_schema = {"type": "array", "items": list(input_schema)}
+    if not isinstance(input_schema, dict):
+        input_schema = {"type": "object", "properties": {}}
+    tools.append({
+        "name": name,
+        "description": description or "",
+        "input_schema": input_schema,
+    })
+    return tools
+
+
+def _render_tool_result(result: Any) -> str:
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (int, float)):
+        return str(result)
+    if isinstance(result, bytes):
+        try:
+            return result.decode("utf-8")
+        except Exception:
+            return result.decode("latin-1", errors="ignore")
+    if isinstance(result, list):
+        parts = [_render_tool_result(item) for item in result]
+        return "\n".join([p for p in parts if p])
+    if isinstance(result, dict):
+        if "content" in result:
+            return _render_tool_result(result["content"])
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    text_attr = getattr(result, "text", None)
+    if text_attr:
+        return text_attr
+    content_attr = getattr(result, "content", None)
+    if content_attr is not None:
+        return _render_tool_result(content_attr)
+    data = getattr(result, "__dict__", None)
+    if data and data is not result:
+        return _render_tool_result(data)
+    return str(result)
+
+
+class MCPToolManager:
+    def __init__(self, configs: List[MCPServerConfig]):
+        self.configs = [c for c in configs if c.enabled and c.auto_start and c.command]
+        self.tools: List[Dict[str, Any]] = []
+        self.tool_index: Dict[str, Tuple[MCPServerConfig, str]] = {}
+        self.errors: List[str] = []
+
+    def discover(self):
+        if MCP_STDIO_CLIENT is None or MCP_CLIENT_SESSION is None:
+            log("[MCP] Bibliothèque client indisponible : installe `modelcontextprotocol`.")
+            return
+        if not self.configs:
+            return
+
+        async def _discover_all():
+            for cfg in self.configs:
+                try:
+                    result = await _with_mcp_session(
+                        cfg,
+                        lambda session: session.list_tools()
+                    )
+                except Exception as exc:
+                    err = f"[MCP] Impossible de lister les outils pour {cfg.name}: {exc}"
+                    log(err)
+                    self.errors.append(err)
+                    continue
+                extracted = _extract_tools(result)
+                for tool in extracted:
+                    name = tool.get("name")
+                    if not name:
+                        continue
+                    unique = f"{cfg.server_id}:{name}"
+                    description = tool.get("description", "") or cfg.name
+                    input_schema = tool.get("input_schema") or {"type": "object", "properties": {}}
+                    self.tools.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": unique,
+                                "description": description,
+                                "parameters": input_schema,
+                            },
+                        }
+                    )
+                    self.tool_index[unique] = (cfg, name)
+
+        try:
+            asyncio.run(_discover_all())
+        except RuntimeError as exc:
+            # Event loop already running (rare). Use new loop.
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_discover_all())
+            finally:
+                loop.close()
+
+    def has_tools(self) -> bool:
+        return bool(self.tools)
+
+    def handle_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not tool_calls:
+            return []
+        responses: List[Dict[str, Any]] = []
+
+        async def _execute(cfg: MCPServerConfig, tool_name: str, arguments: Dict[str, Any]):
+            async def _runner(session):
+                try:
+                    return await session.call_tool(tool_name, arguments=arguments)
+                except TypeError:
+                    return await session.call_tool(tool_name, arguments)
+
+            return await _with_mcp_session(cfg, _runner)
+
+        for call in tool_calls:
+            tool_call_id = call.get("id") or call.get("call_id")
+            fn = call.get("function") or {}
+            fn_name = fn.get("name") if isinstance(fn, dict) else call.get("name")
+            if not fn_name:
+                continue
+            mapping = self.tool_index.get(fn_name)
+            if not mapping:
+                log(f"[MCP] Outil inconnu demandé: {fn_name}")
+                continue
+            cfg, real_name = mapping
+            raw_args = fn.get("arguments") if isinstance(fn, dict) else call.get("arguments")
+            if isinstance(raw_args, str):
+                try:
+                    arguments = json.loads(raw_args) if raw_args.strip() else {}
+                except json.JSONDecodeError:
+                    arguments = {"input": raw_args}
+            elif isinstance(raw_args, dict):
+                arguments = raw_args
+            else:
+                arguments = {}
+
+            try:
+                try:
+                    result = asyncio.run(_execute(cfg, real_name, arguments))
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        result = loop.run_until_complete(_execute(cfg, real_name, arguments))
+                    finally:
+                        loop.close()
+            except Exception as exc:
+                log(f"[MCP] Erreur pendant l'appel {real_name}: {exc}")
+                text = f"Erreur MCP: {exc}"
+            else:
+                text = _render_tool_result(result) or ""
+
+            responses.append(
+                {
+                    "role": "tool",
+                    "name": fn_name,
+                    "tool_call_id": tool_call_id,
+                    "content": text,
+                }
+            )
+
+        return responses
+
+
+def load_mcp_configs() -> List[MCPServerConfig]:
+    if not MCP_SERVERS_JSON:
+        return []
+    try:
+        data = json.loads(MCP_SERVERS_JSON)
+    except Exception as exc:
+        log(f"[MCP] JSON invalide pour MCP_SERVERS_JSON: {exc}")
+        return []
+    configs: List[MCPServerConfig] = []
+    for idx, raw in enumerate(data):
+        if not isinstance(raw, dict):
+            continue
+        cfg = MCPServerConfig(
+            server_id=str(raw.get("id") or raw.get("server_id") or f"srv_{idx+1}"),
+            name=str(raw.get("name") or raw.get("id") or f"Serveur {idx+1}"),
+            command=str(raw.get("command") or ""),
+            args=[str(a) for a in raw.get("args", []) if str(a)],
+            env={str(k): str(v) for k, v in (raw.get("env") or {}).items()},
+            enabled=bool(raw.get("enabled", True)),
+            auto_start=bool(raw.get("auto_start", True)),
+        )
+        configs.append(cfg)
+    return configs
+
+
+MCP_MANAGER: Optional[MCPToolManager] = None
 # ===================== AUDIO (I/O + samplerate) =====================
 def pick_devices_and_rates(prefer_output_name_substr: str | None = None):
     devices = sd.query_devices()
@@ -473,21 +777,42 @@ def _ollama_options():
         "num_ctx": int(OLLAMA_NUM_CTX),
     }
 
-def generate_full(question: str) -> str:
+def generate_full(question: str, manager: Optional[MCPToolManager] = None) -> str:
     try:
-        resp = ollama_client.chat(
-            model=LLM_ID,
-            messages=_ollama_messages(question),
-            stream=False,
-            options=_ollama_options(),
-        )
-        return (resp.get("message", {}) or {}).get("content", "") or ""
+        messages = _ollama_messages(question)
+        tools = manager.tools if manager and manager.has_tools() else None
+        while True:
+            kwargs = {
+                "model": LLM_ID,
+                "messages": messages,
+                "stream": False,
+                "options": _ollama_options(),
+            }
+            if tools:
+                kwargs["tools"] = tools
+            resp = ollama_client.chat(**kwargs)
+            message = (resp.get("message", {}) or {})
+            if "role" not in message:
+                message["role"] = "assistant"
+            content = message.get("content", "") or ""
+            messages.append(message)
+            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+            if tools and tool_calls:
+                tool_messages = manager.handle_tool_calls(tool_calls)
+                if not tool_messages:
+                    return content
+                messages.extend(tool_messages)
+                continue
+            return content
     except Exception as e:
         log(f"[LLM] Erreur Ollama: {e}")
         return ""
 
-def generate_stream(question: str):
+def generate_stream(question: str, manager: Optional[MCPToolManager] = None):
     try:
+        if manager and manager.has_tools():
+            yield generate_full(question, manager)
+            return
         for chunk in ollama_client.chat(
             model=LLM_ID,
             messages=_ollama_messages(question),
@@ -553,16 +878,18 @@ def handle_command(stt_model: WhisperModel, tts, tok, mdl):
         if "arrête-toi" in user_text or "éteins-toi" in user_text:
             tts.speak("D'accord, je me mets en veille."); stop_main.set(); return
 
-        use_stream = bool(OLLAMA_STREAM) and not tts.clone_once
+        manager = MCP_MANAGER
+        has_tools = bool(manager and manager.has_tools())
+        use_stream = bool(OLLAMA_STREAM) and not tts.clone_once and not has_tools
         if not use_stream:
-            full = generate_full(user_text).strip()
+            full = generate_full(user_text, manager=manager).strip()
             if not full:
                 tts.speak("Désolé, je n'ai rien reçu du modèle."); return
             tts.speak(full)
         else:
             buffer = ""
             first_spoken = False
-            for tok_txt in generate_stream(user_text):
+            for tok_txt in generate_stream(user_text, manager=manager):
                 if not tok_txt:
                     continue
                 buffer += tok_txt
@@ -573,7 +900,7 @@ def handle_command(stt_model: WhisperModel, tts, tok, mdl):
             rest = buffer.strip()
             if rest:
                 tts.speak(rest)
-            elif not first_spoken:
+            elif not first_spoken and not has_tools:
                 tts.speak("Désolé, je n'ai rien reçu du modèle.")
     finally:
         busy.clear()
@@ -636,6 +963,17 @@ def main():
         tts = TTS(lang_id=TTS_LANG)
 
     tok, mdl = init_llm()
+    global MCP_MANAGER
+    configs = load_mcp_configs()
+    if configs:
+        MCP_MANAGER = MCPToolManager(configs)
+        MCP_MANAGER.discover()
+        if MCP_MANAGER.has_tools():
+            log(f"[MCP] {len(MCP_MANAGER.tools)} outil(s) disponibles pour le LLM.")
+        else:
+            log("[MCP] Aucun outil actif (voir configuration / dépendances).")
+    else:
+        MCP_MANAGER = None
     try:
         wake_loop(stt_model, tts, tok, mdl)
     except KeyboardInterrupt:
