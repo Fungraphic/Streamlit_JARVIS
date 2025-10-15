@@ -229,6 +229,14 @@ if "jarvis_running" not in st.session_state:
     st.session_state.jarvis_running = False
 if "jarvis_logbuf" not in st.session_state:
     st.session_state.jarvis_logbuf = []
+if "interaction_mode" not in st.session_state:
+    st.session_state.interaction_mode = "chat"
+if "last_assistant_ts" not in st.session_state:
+    st.session_state.last_assistant_ts = 0.0
+if "assistant_speaking" not in st.session_state:
+    st.session_state.assistant_speaking = False
+if "previous_interaction_mode" not in st.session_state:
+    st.session_state.previous_interaction_mode = st.session_state.interaction_mode
 
 def _load_jarvis_module(path: str):
     spec = importlib.util.spec_from_file_location("jarvis", path)
@@ -301,6 +309,14 @@ def drain_jarvis_logs(max_keep: int = 800):
     if pulled:
         st.session_state.jarvis_logbuf += pulled
         st.session_state.jarvis_logbuf = st.session_state.jarvis_logbuf[-max_keep:]
+        speech_detected = False
+        for line in pulled:
+            if line.startswith("JARVIS:"):
+                speech_detected = True
+                break
+        if speech_detected:
+            st.session_state.last_assistant_ts = time.time()
+            st.session_state.assistant_speaking = True
 
 # -------------- CSS --------------
 st.markdown("""
@@ -341,27 +357,59 @@ body::before{
 .card h3{ margin: 0 0 8px 0; color: var(--fg); }
 .muted{ color: var(--muted-fg); }
 
-.visualizer{ position:relative; width:100%; max-width: 420px; height: 320px;
-  display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:12px;
-  background: radial-gradient(600px 600px at 50% 50%, rgba(68,241,255,0.05), transparent 70%);
-  border: 1px dashed rgba(255,255,255,0.08); margin: 0 auto; }
-.ring{ position:absolute; border:1px solid rgba(68,241,255,0.25); border-radius:999px; animation: ringPulse 2.4s ease-in-out infinite; }
-.r1{ width:40%; height:40%; animation-delay: 0s; }
-.r2{ width:62%; height:62%; animation-delay: .18s; }
-.r3{ width:84%; height:84%; animation-delay: .36s; }
-@keyframes ringPulse{ 0%{ box-shadow: 0 0 0 0 rgba(68,241,255,0.25); }
-  50%{ box-shadow: 0 0 16px 0 rgba(68,241,255,0.50), inset 0 0 18px rgba(68,241,255,0.08); }
-  100%{ box-shadow: 0 0 0 0 rgba(68,241,255,0.25); } }
+.visualizer{ position:relative; width:min(100%, 360px); aspect-ratio: 1 / 1; margin: 18px auto 0;
+  display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:50%;
+  background: radial-gradient(320px 320px at 50% 50%, rgba(68,241,255,0.08), transparent 70%);
+  border: 1px dashed rgba(255,255,255,0.08); transform: translateZ(0); transition: box-shadow .3s ease; }
+.visualizer::after{ content:""; position:absolute; inset:12%; border-radius:50%;
+  border:1px solid rgba(68,241,255,0.12); box-shadow: inset 0 0 20px rgba(68,241,255,0.05);
+  pointer-events:none; }
+.visualizer.speaking{ box-shadow: 0 0 32px rgba(68,241,255,0.35); animation: radarVibrate .45s ease-in-out infinite; }
+.ring{ position:absolute; top:50%; left:50%; transform:translate(-50%, -50%);
+  border:1px solid rgba(68,241,255,0.22); border-radius:50%; animation: ringPulse 2.4s ease-in-out infinite; }
+.visualizer.speaking .ring{ border-color: rgba(68,241,255,0.4); animation-duration: 1.6s; box-shadow: 0 0 18px rgba(68,241,255,0.18); }
+.r1{ width:36%; height:36%; animation-delay: 0s; }
+.r2{ width:58%; height:58%; animation-delay: .18s; }
+.r3{ width:80%; height:80%; animation-delay: .36s; }
+@keyframes ringPulse{ 0%{ box-shadow: 0 0 0 0 rgba(68,241,255,0.18); opacity:.6; }
+  50%{ box-shadow: 0 0 24px 0 rgba(68,241,255,0.45), inset 0 0 22px rgba(68,241,255,0.12); opacity:1; }
+  100%{ box-shadow: 0 0 0 0 rgba(68,241,255,0.18); opacity:.6; } }
+@keyframes radarVibrate{ 0%{ transform: translateZ(0) scale(1); }
+  35%{ transform: translateZ(0) scale(1.035); }
+  65%{ transform: translateZ(0) scale(1.02); }
+  100%{ transform: translateZ(0) scale(1); } }
+.visualizer .eq{ position:absolute; bottom:18%; left:50%; transform:translateX(-50%);
+  display:flex; align-items:flex-end; gap:8px; width:60%; height:36%; pointer-events:none; }
+.visualizer .eq .bar{ flex:1; max-width:12px; height:100%; border-radius:999px;
+  background: linear-gradient(180deg, rgba(68,241,255,0.18) 0%, rgba(68,241,255,0.75) 100%);
+  transform-origin: bottom; transform: scaleY(0.25); opacity:0.5; transition: opacity .3s ease; }
+.visualizer.speaking .eq .bar{ opacity:0.95; animation: eqDance .85s ease-in-out infinite; }
+.visualizer.speaking .eq .bar:nth-child(2){ animation-delay: .12s; }
+.visualizer.speaking .eq .bar:nth-child(3){ animation-delay: .24s; }
+.visualizer.speaking .eq .bar:nth-child(4){ animation-delay: .12s; }
+.visualizer.speaking .eq .bar:nth-child(5){ animation-delay: .3s; }
+@keyframes eqDance{ 0%{ transform: scaleY(0.25); }
+  35%{ transform: scaleY(1); }
+  55%{ transform: scaleY(0.45); }
+  75%{ transform: scaleY(0.85); }
+  100%{ transform: scaleY(0.25); } }
+.radar-label{ position:absolute; inset:auto; top:50%; left:50%; transform:translate(-50%, -50%);
+  padding:8px 12px; border-radius:999px; background:rgba(11,15,20,0.75); border:1px solid rgba(68,241,255,0.35);
+  font-size:13px; letter-spacing:1px; text-transform:uppercase; color:var(--primary); }
+.visualizer.speaking .radar-label{ color:#0b0f14; background:rgba(68,241,255,0.85); }
 
 .chat-wrap{ display:flex; flex-direction:column; height:520px; }
 .msgs{ flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; padding-right:6px; }
 .bubble{ max-width: 92%; padding:10px 12px; border-radius: 12px; border: 1px solid var(--border); }
 .user{ align-self:flex-end; background: rgba(68,241,255,0.08); }
 .assistant{ align-self:flex-start; background: rgba(255,255,255,0.04); }
-.input-row{ display:flex; gap:8px; align-items:center; margin-top:8px; }
-.input-row input{ flex:1; background: var(--accent); color: var(--fg); border:1px solid var(--border); border-radius: 10px; padding:10px 12px; }
-.input-row button{ background: linear-gradient(180deg, #0b485b, #083947);
-  border:1px solid var(--primary-2); color: white; border-radius: 10px; padding:10px 14px; cursor:pointer; }
+.chat-toggle{ margin-top:8px; }
+.chat-toggle [data-testid="stToggle"]{ width:100%; background: var(--accent); padding:10px 12px; border-radius: 12px; border:1px solid var(--border); }
+.chat-toggle [data-testid="stToggle"] label{ color: var(--fg); font-weight:600; }
+.chat-toggle [data-testid="stToggle"] [data-testid="stTickBar"]{ background: var(--primary); }
+.chat-input input{ background: var(--accent) !important; color: var(--fg) !important; border:1px solid var(--border); border-radius: 10px; padding:10px 12px; }
+.chat-send button{ background: linear-gradient(180deg, #0b485b, #083947); border:1px solid var(--primary-2); color: white; border-radius: 10px; padding:10px 14px; cursor:pointer; }
+.chat-send button:disabled{ background: linear-gradient(180deg, #1a222d, #121a24); border-color: var(--border); color: var(--muted-fg); cursor:not-allowed; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -384,35 +432,100 @@ st.markdown("""
 tab_interface, tab_settings = st.tabs(["🎛️ Interface", "⚙️ Settings"])
 
 with tab_interface:
+    now_ts = time.time()
+    last_ts = st.session_state.get("last_assistant_ts", 0.0)
+    speaking = bool(st.session_state.get("assistant_speaking", False))
+
+    if speaking and last_ts and (now_ts - last_ts) >= 6:
+        speaking = False
+        st.session_state.assistant_speaking = False
+
+    mode = st.session_state.get("interaction_mode", "chat")
+    radar_class = "visualizer speaking" if speaking else "visualizer"
+    radar_label = "Mode vocal" if mode == "vocal" else "Mode chat"
+
     c1, c2 = st.columns([5,7])
     with c1:
         st.markdown('<div class="card"><h3>Radar Vocal</h3>', unsafe_allow_html=True)
-        st.markdown('<div class="visualizer"><div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div></div>', unsafe_allow_html=True)
+        radar_markup = f"""
+        <div class="{radar_class}">
+          <div class="ring r1"></div>
+          <div class="ring r2"></div>
+          <div class="ring r3"></div>
+          <div class="eq">
+            <span class="bar"></span>
+            <span class="bar"></span>
+            <span class="bar"></span>
+            <span class="bar"></span>
+            <span class="bar"></span>
+          </div>
+          <div class="radar-label">{radar_label}</div>
+        </div>
+        """
+        st.markdown(radar_markup, unsafe_allow_html=True)
         st.markdown('<p class="muted" style="margin-top:8px;">Affichage compact. (Le backend micro/FFT est côté jarvis.py)</p></div>', unsafe_allow_html=True)
     with c2:
         st.markdown('<div class="card"><h3>Chat</h3><div class="chat-wrap">', unsafe_allow_html=True)
         st.markdown('<div class="msgs">', unsafe_allow_html=True)
         msgs = st.session_state.setdefault("messages", [])
         for m in msgs:
-            role = m.get("role","assistant")
-            content = m.get("content","")
-            cls = "bubble assistant" if role!="user" else "bubble user"
+            role = m.get("role", "assistant")
+            content = m.get("content", "")
+            cls = "bubble assistant" if role != "user" else "bubble user"
             st.markdown(f'<div class="{cls}">{content}</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-        cols = st.columns([1,10,2])
+        cols = st.columns([2, 8, 3])
+        with cols[0]:
+            st.markdown('<div class="chat-toggle">', unsafe_allow_html=True)
+            vocal_active = st.toggle(
+                "🎙️ Mode vocal",
+                value=(mode == "vocal"),
+                key="mode_toggle",
+                help="Active le mode vocal pour répondre par la voix",
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+        mode = "vocal" if vocal_active else "chat"
+        st.session_state.interaction_mode = mode
+        if mode != st.session_state.previous_interaction_mode and mode == "vocal":
+            st.session_state["chat_input"] = ""
+        st.session_state.previous_interaction_mode = mode
+
+        placeholder_text = (
+            "MODE VOCAL ACTIVÉ - Utilise ton micro"
+            if mode == "vocal"
+            else "MODE CHAT ACTIVÉ - Commence la conversation"
+        )
+
         with cols[1]:
-            # FIX: label non vide + masqué => supprime le warning Streamlit
-            user_text = st.text_input("Message", key="chat_input",
-                                      placeholder="MODE CHAT ACTIVÉ - Commence la conversation",
-                                      label_visibility="collapsed")
+            st.markdown('<div class="chat-input">', unsafe_allow_html=True)
+            user_text = st.text_input(
+                "Message",
+                key="chat_input",
+                placeholder=placeholder_text,
+                label_visibility="collapsed",
+                disabled=(mode == "vocal"),
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
         with cols[2]:
-            if st.button("Envoyer", use_container_width=True):
-                if user_text.strip():
-                    msgs.append({"role":"user","content": user_text.strip()})
-                    msgs.append({"role":"assistant","content": "Réponse simulée (brancher Ollama)."})
+            st.markdown('<div class="chat-send">', unsafe_allow_html=True)
+            btn_label = "Envoyer" if mode == "chat" else "🎤 Écoute"
+            send_disabled = mode != "chat"
+            if st.button(btn_label, use_container_width=True, disabled=send_disabled, key="send_btn"):
+                if mode == "chat" and user_text.strip():
+                    clean_text = user_text.strip()
+                    msgs.append({"role": "user", "content": clean_text})
+                    reply = "Réponse simulée (brancher Ollama)."
+                    msgs.append({"role": "assistant", "content": reply})
                     st.session_state["messages"] = msgs
+                    st.session_state.last_assistant_ts = time.time()
+                    st.session_state.assistant_speaking = True
                     st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        if mode == "vocal":
+            st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
+
         st.markdown('</div></div>', unsafe_allow_html=True)
 
 with tab_settings:
