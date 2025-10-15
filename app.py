@@ -349,7 +349,7 @@ body::before{
 .card h3{ margin: 0 0 8px 0; color: var(--fg); }
 .muted{ color: var(--muted-fg); }
 
-.visualizer{ position:relative; width:min(100%, 360px); aspect-ratio: 1 / 1; margin: 0 auto;
+.visualizer{ position:relative; width:min(100%, 360px); aspect-ratio: 1 / 1; margin: 16px auto 0;
   display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:50%;
   background: radial-gradient(320px 320px at 50% 50%, rgba(68,241,255,0.08), transparent 70%);
   border: 1px dashed rgba(255,255,255,0.08); transform: translateZ(0); transition: box-shadow .3s ease; }
