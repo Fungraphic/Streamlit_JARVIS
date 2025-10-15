@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, io, json, time, subprocess, importlib.util, threading, queue
+import os, io, json, time, subprocess, importlib.util, threading, queue, html
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
@@ -327,6 +327,36 @@ new_logs = drain_jarvis_logs() if st.session_state.jarvis_running else []
 if new_logs:
     _update_speaking_state_from_logs(new_logs)
 
+
+def _ingest_chat_from_logs(logs: List[str]):
+    if not logs:
+        return
+
+    msgs = st.session_state.setdefault("messages", [])
+    changed = False
+
+    for raw in logs:
+        line = (raw or "").strip()
+        if not line:
+            continue
+
+        if line.startswith("[STT] Vous:"):
+            content = line.split(":", 1)[1].strip()
+            if content:
+                msgs.append({"role": "user", "content": content})
+                changed = True
+        elif line.startswith("JARVIS:"):
+            content = line.split(":", 1)[1].strip()
+            if content:
+                msgs.append({"role": "assistant", "content": content})
+                changed = True
+
+    if changed:
+        st.session_state["messages"] = msgs[-200:]
+
+
+_ingest_chat_from_logs(new_logs)
+
 # -------------- CSS --------------
 st.markdown("""
 <style>
@@ -414,11 +444,14 @@ body::before{
   font-size:13px; letter-spacing:1px; text-transform:uppercase; color:var(--primary); }
 .visualizer.speaking .radar-label{ color:#0b0f14; background:rgba(68,241,255,0.85); }
 
-.chat-wrap{ display:flex; flex-direction:column; height:520px; }
-.msgs{ flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; padding-right:6px; }
+.chat-card{ display:flex; flex-direction:column; gap:12px; min-height:520px; }
+.chat-history{ flex:1; display:flex; }
+.chat-history .msgs{ flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; padding-right:6px; }
 .bubble{ max-width: 92%; padding:10px 12px; border-radius: 12px; border: 1px solid var(--border); }
 .user{ align-self:flex-end; background: rgba(68,241,255,0.08); }
 .assistant{ align-self:flex-start; background: rgba(255,255,255,0.04); }
+.chat-controls [data-testid="stForm"]{ background: linear-gradient(180deg, var(--panel), var(--muted)); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+.chat-controls [data-testid="stForm"] > div{ padding:0 !important; }
 .chat-toggle{ margin-top:8px; }
 .chat-toggle [data-testid="stToggle"]{ width:100%; background: var(--accent); padding:10px 12px; border-radius: 12px; border:1px solid var(--border); }
 .chat-toggle [data-testid="stToggle"] label{ color: var(--fg); font-weight:600; }
@@ -469,68 +502,97 @@ with tab_interface:
         )
         st.markdown('<p class="muted" style="margin-top:8px;">Affichage compact. (Le backend micro/FFT est côté jarvis.py)</p></div>', unsafe_allow_html=True)
     with c2:
-        st.markdown('<div class="card"><h3>Chat</h3><div class="chat-wrap">', unsafe_allow_html=True)
-        st.markdown('<div class="msgs">', unsafe_allow_html=True)
         msgs = st.session_state.setdefault("messages", [])
-        for m in msgs:
-            role = m.get("role", "assistant")
-            content = m.get("content", "")
-            cls = "bubble assistant" if role != "user" else "bubble user"
-            st.markdown(f'<div class="{cls}">{content}</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
 
-        cols = st.columns([2, 8, 3])
-        with cols[0]:
-            st.markdown('<div class="chat-toggle">', unsafe_allow_html=True)
-            vocal_active = st.toggle(
-                "🎙️ Mode vocal",
-                value=(mode == "vocal"),
-                key="mode_toggle",
-                help="Active le mode vocal pour répondre par la voix",
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-        mode = "vocal" if vocal_active else "chat"
-        st.session_state.interaction_mode = mode
-        if mode != st.session_state.previous_interaction_mode and mode == "vocal":
-            st.session_state["chat_input"] = ""
-        st.session_state.previous_interaction_mode = mode
+        def _render_messages(messages: List[Dict[str, str]]) -> str:
+            if not messages:
+                return (
+                    '<div class="msgs"><div class="bubble assistant muted">'
+                    "Aucun échange pour le moment."
+                    "</div></div>"
+                )
 
-        placeholder_text = (
-            "MODE VOCAL ACTIVÉ - Utilise ton micro"
-            if mode == "vocal"
-            else "MODE CHAT ACTIVÉ - Commence la conversation"
+            bubbles = []
+            for msg in messages:
+                role = msg.get("role", "assistant")
+                content = msg.get("content", "")
+                cls = "bubble assistant" if role != "user" else "bubble user"
+                safe_content = html.escape(str(content)).replace("\n", "<br />")
+                bubbles.append(f'<div class="{cls}">{safe_content}</div>')
+            return f"<div class='msgs'>{''.join(bubbles)}</div>"
+
+        history_html = _render_messages(msgs)
+        st.markdown(
+            '<div class="card chat-card"><h3>Chat</h3>'
+            f'<div class="chat-history">{history_html}</div>'
+            '<div class="chat-controls">',
+            unsafe_allow_html=True,
         )
 
-        with cols[1]:
-            st.markdown('<div class="chat-input">', unsafe_allow_html=True)
-            user_text = st.text_input(
-                "Message",
-                key="chat_input",
-                placeholder=placeholder_text,
-                label_visibility="collapsed",
-                disabled=(mode == "vocal"),
+        with st.form("chat_controls", clear_on_submit=False):
+            cols = st.columns([2, 8, 3])
+            with cols[0]:
+                st.markdown('<div class="chat-toggle">', unsafe_allow_html=True)
+                vocal_active = st.toggle(
+                    "🎙️ Mode vocal",
+                    value=(mode == "vocal"),
+                    key="mode_toggle",
+                    help="Active le mode vocal pour répondre par la voix",
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            mode = "vocal" if vocal_active else "chat"
+            st.session_state.interaction_mode = mode
+
+            previous_mode = st.session_state.previous_interaction_mode
+            if mode != previous_mode and mode == "vocal":
+                st.session_state["chat_input"] = ""
+            st.session_state.previous_interaction_mode = mode
+
+            placeholder_text = (
+                "MODE VOCAL ACTIVÉ - Utilise ton micro"
+                if mode == "vocal"
+                else "MODE CHAT ACTIVÉ - Commence la conversation"
             )
-            st.markdown('</div>', unsafe_allow_html=True)
-        with cols[2]:
-            st.markdown('<div class="chat-send">', unsafe_allow_html=True)
-            btn_label = "Envoyer" if mode == "chat" else "🎤 Écoute"
-            send_disabled = mode != "chat"
-            if st.button(btn_label, use_container_width=True, disabled=send_disabled, key="send_btn"):
-                if mode == "chat" and user_text.strip():
-                    clean_text = user_text.strip()
-                    msgs.append({"role": "user", "content": clean_text})
-                    reply = "Réponse simulée (brancher Ollama)."
-                    msgs.append({"role": "assistant", "content": reply})
-                    st.session_state["messages"] = msgs
-                    st.session_state.last_assistant_ts = time.time()
-                    st.session_state.assistant_speaking = True
-                    st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
+
+            with cols[1]:
+                st.markdown('<div class="chat-input">', unsafe_allow_html=True)
+                user_text = st.text_input(
+                    "Message",
+                    key="chat_input",
+                    placeholder=placeholder_text,
+                    label_visibility="collapsed",
+                    disabled=(mode == "vocal"),
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            with cols[2]:
+                st.markdown('<div class="chat-send">', unsafe_allow_html=True)
+                btn_label = "Envoyer" if mode == "chat" else "🎤 Écoute"
+                send_disabled = mode != "chat"
+                submitted = st.form_submit_button(
+                    btn_label,
+                    disabled=send_disabled,
+                    use_container_width=True,
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('</div></div>', unsafe_allow_html=True)
 
         if mode == "vocal":
             st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
 
-        st.markdown('</div></div>', unsafe_allow_html=True)
+        if submitted and mode == "chat":
+            clean_text = user_text.strip()
+            if clean_text:
+                msgs.append({"role": "user", "content": clean_text})
+                reply = "Réponse simulée (brancher Ollama)."
+                msgs.append({"role": "assistant", "content": reply})
+                st.session_state["messages"] = msgs
+                st.session_state.last_assistant_ts = time.time()
+                st.session_state.assistant_speaking = True
+                st.session_state["chat_input"] = ""
+                st.rerun()
 
 with tab_settings:
     # Ajout d'un sous-onglet Jarvis pour audio local
