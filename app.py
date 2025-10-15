@@ -237,6 +237,25 @@ if "assistant_speaking" not in st.session_state:
     st.session_state.assistant_speaking = False
 if "previous_interaction_mode" not in st.session_state:
     st.session_state.previous_interaction_mode = st.session_state.interaction_mode
+if "mode_toggle" not in st.session_state:
+    st.session_state.mode_toggle = st.session_state.interaction_mode == "vocal"
+
+
+def _set_interaction_mode(mode: str):
+    mode = "vocal" if mode == "vocal" else "chat"
+    if mode != st.session_state.interaction_mode and mode == "vocal":
+        st.session_state["chat_input"] = ""
+    st.session_state.interaction_mode = mode
+    st.session_state.previous_interaction_mode = mode
+    st.session_state.mode_toggle = mode == "vocal"
+
+
+def _sync_mode_from_toggle():
+    desired = "vocal" if st.session_state.get("mode_toggle") else "chat"
+    _set_interaction_mode(desired)
+
+
+_set_interaction_mode(st.session_state.interaction_mode)
 
 def _load_jarvis_module(path: str):
     spec = importlib.util.spec_from_file_location("jarvis", path)
@@ -501,10 +520,9 @@ with tab_interface:
         )
         st.markdown('<p class="muted" style="margin-top:8px;">Affichage compact. (Le backend micro/FFT est côté jarvis.py)</p></div>', unsafe_allow_html=True)
     with c2:
-        st.markdown('<div class="card chat-card">', unsafe_allow_html=True)
-        inner = st.container()
-        with inner:
-            st.markdown('<div class="chat-card-body">', unsafe_allow_html=True)
+        chat_container = st.container()
+        with chat_container:
+            st.markdown('<div class="card chat-card"><div class="chat-card-body">', unsafe_allow_html=True)
             st.markdown('<h3>Chat</h3>', unsafe_allow_html=True)
             st.markdown('<div class="chat-wrap">', unsafe_allow_html=True)
             msgs = st.session_state.setdefault("messages", [])
@@ -529,22 +547,19 @@ with tab_interface:
             st.markdown(_render_messages(msgs), unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-            cols = st.columns([2, 8, 3])
+            cols = st.columns([3, 8, 3])
             with cols[0]:
                 st.markdown('<div class="chat-toggle">', unsafe_allow_html=True)
-                vocal_active = st.toggle(
+                st.toggle(
                     "🎙️ Mode vocal",
-                    value=(mode == "vocal"),
                     key="mode_toggle",
+                    value=st.session_state.mode_toggle,
                     help="Active le mode vocal pour répondre par la voix",
+                    on_change=_sync_mode_from_toggle,
                 )
                 st.markdown('</div>', unsafe_allow_html=True)
-            mode = "vocal" if vocal_active else "chat"
-            st.session_state.interaction_mode = mode
-            if mode != st.session_state.previous_interaction_mode and mode == "vocal":
-                st.session_state["chat_input"] = ""
-            st.session_state.previous_interaction_mode = mode
 
+            mode = st.session_state.interaction_mode
             placeholder_text = (
                 "MODE VOCAL ACTIVÉ - Utilise ton micro"
                 if mode == "vocal"
@@ -581,8 +596,7 @@ with tab_interface:
             if mode == "vocal":
                 st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
 
-            st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('</div></div>', unsafe_allow_html=True)
 
 with tab_settings:
     # Ajout d'un sous-onglet Jarvis pour audio local
