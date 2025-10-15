@@ -357,6 +357,21 @@ body::before{
   border:1px solid rgba(68,241,255,0.12); box-shadow: inset 0 0 20px rgba(68,241,255,0.05);
   pointer-events:none; }
 .visualizer.speaking{ box-shadow: 0 0 32px rgba(68,241,255,0.35); animation: radarVibrate .45s ease-in-out infinite; }
+.equalizer{ position:absolute; bottom:22%; left:50%; transform:translateX(-50%);
+  display:flex; align-items:flex-end; justify-content:center; gap:6px; width:64px; height:26%;
+  opacity:0.0; transition: opacity .25s ease; }
+.visualizer.speaking .equalizer{ opacity:1; }
+.equalizer .bar{ flex:1; height:25%; border-radius:999px; background:rgba(68,241,255,0.55);
+  transform-origin:center bottom; transform:scaleY(.35); filter: drop-shadow(0 0 6px rgba(68,241,255,0.45));
+  transition: transform .25s ease; }
+.equalizer .bar::after{ content:""; display:block; width:100%; height:100%; border-radius:inherit;
+  background: linear-gradient(180deg, rgba(68,241,255,0.85) 0%, rgba(0,194,209,0.35) 100%);
+  opacity:.85; }
+.visualizer.speaking .equalizer .bar{ animation: eqDance 0.95s ease-in-out infinite; }
+.visualizer.speaking .equalizer .b2{ animation-duration: 0.82s; animation-delay: .08s; }
+.visualizer.speaking .equalizer .b3{ animation-duration: 1.05s; animation-delay: .14s; }
+.visualizer.speaking .equalizer .b4{ animation-duration: 0.78s; animation-delay: .2s; }
+.visualizer.speaking .equalizer .b5{ animation-duration: 0.98s; animation-delay: .26s; }
 .ring{ position:absolute; top:50%; left:50%; transform:translate(-50%, -50%);
   border:1px solid rgba(68,241,255,0.22); border-radius:50%; animation: ringPulse 2.4s ease-in-out infinite; }
 .visualizer.speaking .ring{ border-color: rgba(68,241,255,0.4); animation-duration: 1.6s; box-shadow: 0 0 18px rgba(68,241,255,0.18); }
@@ -369,7 +384,14 @@ body::before{
 @keyframes radarVibrate{ 0%{ transform: translateZ(0) scale(1); }
   35%{ transform: translateZ(0) scale(1.035); }
   65%{ transform: translateZ(0) scale(1.02); }
-  100%{ transform: translateZ(0) scale(1); } }
+  100%{ transform: translateZ(0) scale(1); }
+}
+@keyframes eqDance{
+  0%, 100%{ transform: scaleY(.25); }
+  30%{ transform: scaleY(.95); }
+  55%{ transform: scaleY(.55); }
+  75%{ transform: scaleY(1.2); }
+}
 .radar-label{ position:absolute; inset:auto; top:50%; left:50%; transform:translate(-50%, -50%);
   padding:8px 12px; border-radius:999px; background:rgba(11,15,20,0.75); border:1px solid rgba(68,241,255,0.35);
   font-size:13px; letter-spacing:1px; text-transform:uppercase; color:var(--primary); }
@@ -423,7 +445,9 @@ with tab_interface:
     with c1:
         st.markdown('<div class="card"><h3>Radar Vocal</h3>', unsafe_allow_html=True)
         st.markdown(
-            f'<div class="{radar_class}"><div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div><div class="radar-label">{radar_label}</div></div>',
+            f'<div class="{radar_class}"><div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div>'
+            '<div class="equalizer"><div class="bar b1"></div><div class="bar b2"></div><div class="bar b3"></div><div class="bar b4"></div><div class="bar b5"></div></div>'
+            f'<div class="radar-label">{radar_label}</div></div>',
             unsafe_allow_html=True,
         )
         st.markdown('<p class="muted" style="margin-top:8px;">Affichage compact. (Le backend micro/FFT est côté jarvis.py)</p></div>', unsafe_allow_html=True)
