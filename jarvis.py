@@ -3,7 +3,6 @@
 
 # Dépendances:
 #   pip install -U ollama rapidfuzz
-#   # TTS (optionnel): pip install -U chatterbox-tts torchaudio
 #   # Piper (recommandé pour vitesse): pip install -U piper-tts piper-phonemize onnxruntime
 #   # (NVIDIA optionnel pour Piper):  pip install -U onnxruntime-gpu
 #   # Fallback TTS (Linux): sudo apt-get install -y espeak-ng || sudo apt-get install -y espeak
@@ -12,7 +11,6 @@ import os, time, threading, queue, tempfile, sys, warnings, logging, shutil, sub
 
 # --- Forcer CPU pour éviter OOM / chargements CUDA accidentels ---
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-PATCH_TORCH_LOAD_CPU = True
 
 import numpy as np
 import sounddevice as sd
@@ -29,32 +27,74 @@ warnings.filterwarnings("ignore", category=UserWarning,
 warnings.filterwarnings("ignore", message=r"`torch\.backends\.cuda\.sdp_kernel\(\)` is deprecated")
 warnings.filterwarnings("ignore", message=r"We detected that you are passing `past_key_values`")
 
-# -- MUTE Chatterbox mel/tokens warning ---------------------------------------
-MEL_WARN_SUBSTR = "Reference mel length is not equal to 2 * reference token length"
-class _SilenceMelWarn(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            return MEL_WARN_SUBSTR not in record.getMessage()
-        except Exception:
-            return True
-logging.getLogger().addFilter(_SilenceMelWarn())
-# ------------------------------------------------------------------------------
-
 from faster_whisper import WhisperModel
-from ollama import Client as OllamaClient
+
+try:
+    from ollama import Client as OllamaClient  # type: ignore
+    _OLLAMA_VIA_HTTP = False
+except ModuleNotFoundError:
+    OllamaClient = None  # type: ignore
+    _OLLAMA_VIA_HTTP = True
+    import requests
+
+    class OllamaHTTPClient:
+        """Remplacement minimal basé sur l'API HTTP quand le package ollama n'est pas dispo."""
+
+        def __init__(self, host: str, timeout: float | None = None):
+            self.host = host.rstrip("/") or "http://127.0.0.1:11434"
+            self.timeout = timeout
+
+        def _post(self, payload: dict, stream: bool = False):
+            url = f"{self.host}/api/chat"
+            resp = requests.post(
+                url,
+                json=payload,
+                stream=stream,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            return resp
+
+        def chat(self, *, model: str, messages: list[dict], stream: bool, options: dict):
+            payload = {
+                "model": model,
+                "messages": messages,
+                "options": options,
+            }
+            if stream:
+                with self._post(payload, stream=True) as resp:
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            line = line.partition(":")[2].strip()
+                        try:
+                            yield json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+            else:
+                resp = self._post(payload, stream=False)
+                return resp.json()
+
+    OllamaClient = OllamaHTTPClient  # type: ignore
 
 # Rabaisse le niveau de log
-for name in ["chatterbox", "diffusers", "transformers"]:
+for name in ["diffusers", "transformers"]:
     logging.getLogger(name).setLevel(logging.ERROR)
-logging.getLogger("chatterbox.models.t3.inference.alignment_stream_analyzer").setLevel(logging.ERROR)
 
 # ===================== CONFIG =====================
-WAKE_WORD = "jarvis"
-WAKE_ALIASES = (
+_DEFAULT_WAKE_ALIASES = (
     "jervis", "je revis", "je revisse", "jar vise", "j'en revise",
     "jarvy", "jarviz", "jarviss", "jarvice",
     "ok jarvis", "dis jarvis", "hey jarvis",
 )
+
+WAKE_WORD = os.getenv("WAKE_WORD", "jarvis").strip() or "jarvis"
+_wake_aliases_env = os.getenv("WAKE_ALIASES", "")
+if _wake_aliases_env.strip():
+    WAKE_ALIASES = tuple(a.strip() for a in re.split(r"[,;\n]", _wake_aliases_env) if a.strip())
+else:
+    WAKE_ALIASES = _DEFAULT_WAKE_ALIASES
 WAKE_WINDOW_S = 1.8
 
 FW_MODEL   = os.getenv("FW_MODEL", "small")
@@ -62,10 +102,15 @@ FW_DEVICE  = os.getenv("FW_DEVICE", "cpu")
 FW_COMPUTE = os.getenv("FW_COMPUTE", "int8")
 
 # STT
-FW_PROMPT     = os.getenv("FW_PROMPT", "Transcris strictement en français (fr). Noms propres: Jarvis, capitale, Paris, France, météo, heure, système.")
+FW_PROMPT     = os.getenv(
+    "FW_PROMPT",
+    "Transcris strictement en français (fr). Noms propres: Jarvis, capitale, Paris, France, météo, heure, système.",
+)
+FW_LANGUAGE   = os.getenv("FW_LANGUAGE", "fr").strip()
 FW_BEAM_WAKE  = int(os.getenv("FW_BEAM_WAKE", "1"))
 FW_BEAM_CMD   = int(os.getenv("FW_BEAM_CMD",  "1"))
 FW_VAD_CMD    = int(os.getenv("FW_VAD_CMD",   "0"))   # 0 = OFF (on coupe au silence micro)
+FW_VAD_WAKE   = int(os.getenv("FW_VAD_WAKE",  "1"))
 
 # Capture audio à faible latence (fin de phrase)
 REC_MAX_S       = float(os.getenv("REC_MAX_S", "6.0"))
@@ -77,6 +122,15 @@ LLM_ID       = os.getenv("LLM_ID", "jarvis-hermes2pro-fr")
 OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_TIMEOUT = os.getenv("OLLAMA_TIMEOUT", "120")  # "120" ou "none"
 _ollama_timeout = None if OLLAMA_TIMEOUT.strip().lower() in ("none", "null") else float(OLLAMA_TIMEOUT)
+try:
+    OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.7"))
+except ValueError:
+    OLLAMA_TEMPERATURE = 0.7
+try:
+    OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+except ValueError:
+    OLLAMA_NUM_CTX = 4096
+OLLAMA_STREAM = int(os.getenv("OLLAMA_STREAM", "1"))
 
 # Wake config
 REQUIRE_WAKE     = int(os.getenv("REQUIRE_WAKE", "1"))
@@ -84,19 +138,9 @@ WAKE_FUZZY       = int(os.getenv("WAKE_FUZZY", "1"))
 WAKE_FUZZY_SCORE = int(os.getenv("WAKE_FUZZY_SCORE", "80"))
 
 # ===================== TTS (config) =====================
-# Sélecteur de moteur: "chatterbox" (par défaut) ou "piper"
-TTS_ENGINE = os.getenv("TTS_ENGINE", "chatterbox").lower()
-
-# Chatterbox (réglages + voix de référence)
-TTS_DEVICE = os.getenv("TTS_DEVICE", "cpu")
+# Sélecteur de moteur: "piper" ou "fallback" (espeak/say)
+TTS_ENGINE = os.getenv("TTS_ENGINE", "piper").lower()
 TTS_LANG   = os.getenv("TTS_LANG", "fr")
-DEFAULT_TTS_CFG_WEIGHT   = float(os.getenv("TTS_CFG_WEIGHT", "0.3"))
-DEFAULT_TTS_EXAGGERATION = float(os.getenv("TTS_EXAGGERATION", "0.4"))
-DEFAULT_TTS_REF_WAV = os.getenv("TTS_REF_WAV", "/home/fungraphic/Jarvis_2.0/voix/jarvis_fr_film_mono24k.wav")
-TTS_CLONE_ONCE   = int(os.getenv("TTS_CLONE_ONCE", "1"))
-TTS_REF_TRIM_S   = float(os.getenv("TTS_REF_TRIM_S", "3.5"))
-TTS_REF_PAD_S    = float(os.getenv("TTS_REF_PAD_S",  "0.12"))
-TTS_REF_FRAME_S  = float(os.getenv("TTS_REF_FRAME_S","0.02"))
 
 # Piper (chemins & sliders)
 PIPER_VOICE     = os.getenv("PIPER_VOICE", "")  # ex: /home/.../fr_FR-lessac-medium.onnx  (et fr_FR-lessac-medium.onnx.json à côté)
@@ -105,6 +149,11 @@ PIPER_NOISE     = float(os.getenv("PIPER_NOISE",  "0.667"))
 PIPER_NOISE_W   = float(os.getenv("PIPER_NOISE_W","0.8"))
 PIPER_SENT_SIL  = float(os.getenv("PIPER_SENT_SIL","0.10"))
 PIPER_CUDA      = int(os.getenv("PIPER_CUDA", "0"))
+try:
+    _spk_raw = os.getenv("PIPER_SPEAKER_ID", "")
+    PIPER_SPEAKER_ID = int(_spk_raw) if _spk_raw.strip() else None
+except ValueError:
+    PIPER_SPEAKER_ID = None
 
 # Audio out préf (éviter HDMI)
 AUDIO_OUT_PREF = os.getenv("AUDIO_OUT", "analog")
@@ -216,8 +265,18 @@ def write_wav_tmp(audio_i16: np.ndarray, boost: float = 2.0) -> str:
     return path
 
 # ===================== STT (Faster-Whisper) =====================
+def _fw_language_arg() -> str | None:
+    lang = (FW_LANGUAGE or "").strip()
+    if not lang:
+        return None
+    if lang.lower() in ("auto", "none", "default"):
+        return None
+    return lang
+
 def init_faster_whisper():
-    log(f"[STT] Chargement Faster-Whisper: model={FW_MODEL} device={FW_DEVICE} compute={FW_COMPUTE}")
+    lang = _fw_language_arg()
+    lang_info = lang or "auto"
+    log(f"[STT] Chargement Faster-Whisper: model={FW_MODEL} device={FW_DEVICE} compute={FW_COMPUTE} lang={lang_info}")
     return WhisperModel(FW_MODEL, device=FW_DEVICE, compute_type=FW_COMPUTE)
 
 def transcribe_path(
@@ -276,113 +335,23 @@ def _say_fallback(text: str, lang: str) -> bool:
             pass
     return False
 
-def _best_window_trim(y: np.ndarray, sr: int, window_s: float, frame_s: float, pad_s: float):
-    """Prend la fenêtre de durée window_s avec énergie moyenne max. Ajoute pad de chaque côté."""
-    if y.ndim > 1:
-        y = y.mean(axis=1)
-    y = y.astype(np.float32)
-    if y.size == 0:
-        return y
-    frame = max(1, int(frame_s * sr))
-    win = max(1, int(window_s / frame_s))
-    n_frames = len(y) // frame
-    if n_frames == 0:
-        return y
-    e = np.abs(y[:n_frames*frame]).reshape(n_frames, frame).mean(axis=1)
-    if len(e) <= win:
-        start_f = 0
-    else:
-        c = np.convolve(e, np.ones(win, dtype=np.float32), mode="valid")
-        start_f = int(np.argmax(c))
-    start = max(0, start_f * frame - int(pad_s * sr))
-    end = min(len(y), (start_f + win) * frame + int(pad_s * sr))
-    return y[start:end]
-
 class TTS:
     def __init__(self, lang_id: str = "fr"):
-        self.model = None
         self.lang_id = lang_id
-        self.ref_wav_src = DEFAULT_TTS_REF_WAV
-        self.ref_wav = None  # chemin vers ref trim/cache
-        self.cfg_weight = DEFAULT_TTS_CFG_WEIGHT
-        self.exaggeration = DEFAULT_TTS_EXAGGERATION
-
-        # Patch torch.load → CPU
-        if PATCH_TORCH_LOAD_CPU:
-            try:
-                import torch
-                _orig = torch.load
-                def _patched_load(f, map_location=None, **kw):
-                    if map_location is None:
-                        map_location = "cpu"
-                    return _orig(f, map_location=map_location, **kw)
-                torch.load = _patched_load
-                log("[TTS] torch.load patché (map_location='cpu').")
-            except Exception as e:
-                log(f"[TTS] Patch torch.load impossible: {e}")
-
-        # Trim/cache référence si fournie
-        if self.ref_wav_src and os.path.exists(self.ref_wav_src):
-            try:
-                y, sr = sf.read(self.ref_wav_src, always_2d=False)
-                y = _best_window_trim(y, sr, TTS_REF_TRIM_S, TTS_REF_FRAME_S, TTS_REF_PAD_S)
-                peak = np.max(np.abs(y)) or 1.0
-                y = (y / peak * 0.98).astype(np.float32)
-                self.ref_wav = tempfile.mktemp(prefix="jarvis_ref_", suffix=".wav")
-                sf.write(self.ref_wav, y, sr)
-                log(f"[TTS] Référence trim/cachée: {self.ref_wav}")
-            except Exception as e:
-                log(f"[TTS] Trim ref échoué ({e}), utilisation brute.")
-                self.ref_wav = self.ref_wav_src
-        else:
-            self.ref_wav = self.ref_wav_src if self.ref_wav_src else None
-
-        # Import “lazy”
-        try:
-            try:
-                from chatterbox.mtl_tts import ChatterboxMultilingualTTS as _MTL
-                self.model = _MTL.from_pretrained(device="cpu")  # CPU forcé
-                log(f"[TTS] Engine=Chatterbox Multilingual (cpu) [{self.lang_id}].")
-            except Exception:
-                from chatterbox.tts import ChatterboxTTS as _MONO
-                self.model = _MONO.from_pretrained(device="cpu")
-                log(f"[TTS] Engine=Chatterbox (mono) (cpu).")
-        except Exception as e:
-            log(f"[TTS] Échec init Chatterbox (CPU): {e}")
-            self.model = None
+        self._warned = False
+        log("[TTS] Engine=fallback (espeak/say).")
 
     def speak(self, text: str):
         if not text:
             return
-        if self.model is None:
-            if _say_fallback(text, self.lang_id):
-                return
-            log(f"JARVIS: {text}")
-            return
-        try:
-            log(f"JARVIS: {text}")
-            kwargs = {"exaggeration": self.exaggeration, "cfg_weight": self.cfg_weight}
-            if self.ref_wav and os.path.exists(self.ref_wav):
-                kwargs["audio_prompt_path"] = self.ref_wav
-            if hasattr(self.model, "generate") and "Multilingual" in type(self.model).__name__:
-                kwargs["language_id"] = self.lang_id
-            wav = self.model.generate(text, **kwargs)
-
-            y  = wav.squeeze().detach().cpu().numpy().astype(np.float32)
-            sr_model = int(getattr(self.model, "sr", 48000))
-            out_dev  = sd.query_devices(sd.default.device[1], kind='output')
-            sr_out   = int(out_dev.get('default_samplerate') or 48000)
-            if sr_model != sr_out:
-                y = _resample_linear(y, sr_model, sr_out)
-            sd.play(y, sr_out, blocking=True)
-        except Exception as e:
-            log(f"[TTS] Erreur lecture (fallback system): {e}")
-            if not _say_fallback(text, self.lang_id):
-                log(f"JARVIS: {text}")
+        log(f"JARVIS: {text}")
+        if not _say_fallback(text, self.lang_id) and not self._warned:
+            log("[TTS] Aucun moteur TTS système détecté (espeak/say). Le texte est affiché uniquement.")
+            self._warned = True
 
     @property
     def clone_once(self) -> bool:
-        return bool(self.ref_wav) and bool(TTS_CLONE_ONCE)
+        return False
 
 # ===================== TTS (Piper, streaming rapide) =====================
 
@@ -430,7 +399,8 @@ class PiperTTS:
                  noise_scale: float  = 0.667,
                  noise_w: float      = 0.8,
                  sentence_silence: float | None = 0.10,
-                 use_cuda: bool = False):
+                 use_cuda: bool = False,
+                 speaker_id: int | None = None):
         self.voice = os.path.abspath(voice_path)
         conf = self.voice + ".json" if not self.voice.endswith(".onnx.json") else self.voice
         if not os.path.exists(conf):
@@ -444,6 +414,7 @@ class PiperTTS:
         self.noise_w      = float(noise_w)
         self.sentence_silence = sentence_silence
         self.use_cuda = bool(use_cuda)
+        self.speaker_id = speaker_id if speaker_id is not None else None
 
         self.exe = shutil.which("piper")
         if not self.exe:
@@ -463,6 +434,8 @@ class PiperTTS:
             "--noise-scale",  str(self.noise_scale),
             "--noise-w",      str(self.noise_w),
         ]
+        if self.speaker_id is not None:
+            args += ["--speaker", str(self.speaker_id)]
         if self.sentence_silence is not None:
             # Contrôle des pauses inter-phrases.  # :contentReference[oaicite:3]{index=3}
             args += ["--sentence-silence", str(self.sentence_silence)]
@@ -492,11 +465,20 @@ class PiperTTS:
             # Secours : génération WAV puis lecture blocante
             tmp = tempfile.mktemp(prefix="piper_", suffix=".wav")
             try:
+                fallback_args = [
+                    self.exe, "-m", self.voice, "-f", tmp,
+                    "--length-scale", str(self.length_scale),
+                    "--noise-scale",  str(self.noise_scale),
+                    "--noise-w",      str(self.noise_w),
+                ]
+                if self.speaker_id is not None:
+                    fallback_args += ["--speaker", str(self.speaker_id)]
+                if self.sentence_silence is not None:
+                    fallback_args += ["--sentence-silence", str(self.sentence_silence)]
+                if self.use_cuda:
+                    fallback_args += ["--cuda"]
                 subprocess.run(
-                    [self.exe, "-m", self.voice, "-f", tmp,
-                     "--length-scale", str(self.length_scale),
-                     "--noise-scale",  str(self.noise_scale),
-                     "--noise-w",      str(self.noise_w)],
+                    fallback_args,
                     input=text.encode("utf-8"), check=False
                 )
                 y, sr = sf.read(tmp, dtype="float32", always_2d=False)
@@ -521,28 +503,46 @@ def init_llm():
             ollama_client = OllamaClient(host=OLLAMA_HOST, timeout=_ollama_timeout)
     except TypeError:
         ollama_client = OllamaClient(host=OLLAMA_HOST)
-    log(f"[LLM] Connexion Ollama: host={OLLAMA_HOST} model={LLM_ID} (timeout={OLLAMA_TIMEOUT})")
+    via = "http" if _OLLAMA_VIA_HTTP else "sdk"
+    log(
+        "[LLM] Connexion Ollama (%s): host=%s model=%s timeout=%s temp=%.3f ctx=%s stream=%s"
+        % (via, OLLAMA_HOST, LLM_ID, OLLAMA_TIMEOUT, OLLAMA_TEMPERATURE, OLLAMA_NUM_CTX, bool(OLLAMA_STREAM))
+    )
     return None, None
 
-def generate_full(question: str) -> str:
-    msgs = [
+def _ollama_messages(question: str):
+    return [
         {"role": "system", "content": "Tu es JARVIS, assistant direct et concis. Réponds en français."},
         {"role": "user",   "content": question},
     ]
+
+def _ollama_options():
+    return {
+        "temperature": float(OLLAMA_TEMPERATURE),
+        "num_ctx": int(OLLAMA_NUM_CTX),
+    }
+
+def generate_full(question: str) -> str:
     try:
-        resp = ollama_client.chat(model=LLM_ID, messages=msgs, stream=False)
+        resp = ollama_client.chat(
+            model=LLM_ID,
+            messages=_ollama_messages(question),
+            stream=False,
+            options=_ollama_options(),
+        )
         return (resp.get("message", {}) or {}).get("content", "") or ""
     except Exception as e:
         log(f"[LLM] Erreur Ollama: {e}")
         return ""
 
 def generate_stream(question: str):
-    msgs = [
-        {"role": "system", "content": "Tu es JARVIS, assistant direct et concis. Réponds en français."},
-        {"role": "user",   "content": question},
-    ]
     try:
-        for chunk in ollama_client.chat(model=LLM_ID, messages=msgs, stream=True):
+        for chunk in ollama_client.chat(
+            model=LLM_ID,
+            messages=_ollama_messages(question),
+            stream=True,
+            options=_ollama_options(),
+        ):
             yield (chunk.get("message", {}) or {}).get("content", "") or ""
     except Exception as e:
         log(f"[LLM] Erreur Ollama (stream): {e}")
@@ -593,7 +593,7 @@ def handle_command(stt_model: WhisperModel, tts, tok, mdl):
             return
         wav = write_wav_tmp(audio, boost=2.0)
         user_text = transcribe_path(
-            stt_model, wav, language="fr",
+            stt_model, wav, language=_fw_language_arg(),
             beam_size=FW_BEAM_CMD, initial_prompt=FW_PROMPT, use_vad=bool(FW_VAD_CMD)
         ).lower()
         log(f"[STT] Vous: {user_text}")
@@ -602,7 +602,8 @@ def handle_command(stt_model: WhisperModel, tts, tok, mdl):
         if "arrête-toi" in user_text or "éteins-toi" in user_text:
             tts.speak("D'accord, je me mets en veille."); stop_main.set(); return
 
-        if tts.clone_once:
+        use_stream = bool(OLLAMA_STREAM) and not tts.clone_once
+        if not use_stream:
             full = generate_full(user_text).strip()
             if not full:
                 tts.speak("Désolé, je n'ai rien reçu du modèle."); return
@@ -641,8 +642,8 @@ def wake_loop(stt_model: WhisperModel, tts, tok, mdl):
         wav = write_wav_tmp(audio, boost=1.8)
         try:
             text = transcribe_path(
-                stt_model, wav, language="fr",
-                beam_size=FW_BEAM_WAKE, initial_prompt=FW_PROMPT, use_vad=True
+                stt_model, wav, language=_fw_language_arg(),
+                beam_size=FW_BEAM_WAKE, initial_prompt=FW_PROMPT, use_vad=bool(FW_VAD_WAKE)
             ).lower()
             if text: log(f"[BG] Entendu: {text}")
             if REQUIRE_WAKE:
@@ -664,10 +665,10 @@ def main():
     if tts_engine == "piper":
         voice = _resolve_piper_voice(PIPER_VOICE)
         if not shutil.which("piper"):
-            log("[TTS] Piper sélectionné mais binaire 'piper' introuvable → retour Chatterbox. Installe piper et redémarre. (ex: pacman/apt/pipx)")  # info explicite
+            log("[TTS] Piper sélectionné mais binaire 'piper' introuvable → utilisation du fallback système. Installe piper et redémarre. (ex: pacman/apt/pipx)")
             tts = TTS(lang_id=TTS_LANG)
         elif not voice:
-            log(f"[TTS] Piper sélectionné mais voix introuvable: '{PIPER_VOICE}'. Attendu: <voice>.onnx + <voice>.onnx.json côte-à-côte. → retour Chatterbox.")  # :contentReference[oaicite:4]{index=4}
+            log(f"[TTS] Piper sélectionné mais voix introuvable: '{PIPER_VOICE}'. Attendu: <voice>.onnx + <voice>.onnx.json côte-à-côte. → fallback système.")
             tts = TTS(lang_id=TTS_LANG)
         else:
             tts = PiperTTS(
@@ -677,10 +678,10 @@ def main():
                 noise_w=PIPER_NOISE_W,
                 sentence_silence=PIPER_SENT_SIL,
                 use_cuda=bool(PIPER_CUDA),
+                speaker_id=PIPER_SPEAKER_ID,
             )
-            os.environ["TTS_CLONE_ONCE"] = "0"  # sans effet ici (PiperTTS.clone_once=False), mais clarifie l'intention.
     else:
-        log("[TTS] Engine=Chatterbox (par config).")
+        log("[TTS] Engine=fallback (par config).")
         tts = TTS(lang_id=TTS_LANG)
 
     tok, mdl = init_llm()

@@ -13,11 +13,43 @@ CONFIG_DIR = os.path.expanduser("~/.jarvis")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "ui_config.json")
 
 DEFAULT_CFG: Dict[str, Any] = {
-    "whisper": {"model": "small", "lang": "fr", "vad": True, "device": "cpu", "compute": "int8"},
-    "piper": {"base_dir": os.path.expanduser("~/.jarvis/voices"), "voice": "", "speaker_id": 0, "speed": 1.0, "sr": 22050},
-    "ollama": {"host": "http://127.0.0.1:11434", "model": "qwen2.5:latest", "temperature": 0.7, "num_ctx": 4096, "stream": False},
+    "whisper": {
+        "model": "small",
+        "lang": "fr",
+        "vad": True,
+        "device": "cpu",
+        "compute": "int8",
+        "prompt": "Transcris strictement en français (fr). Noms propres: Jarvis, capitale, Paris, France, météo, heure, système.",
+    },
+    "piper": {
+        "base_dir": os.path.expanduser("~/.jarvis/voices"),
+        "voice": "",
+        "speaker_id": 0,
+        "speed": 0.9,
+        "noise": 0.667,
+        "noise_w": 0.8,
+        "sentence_silence": 0.10,
+        "use_cuda": False,
+    },
+    "ollama": {
+        "host": "http://127.0.0.1:11434",
+        "model": "qwen2.5:latest",
+        "temperature": 0.7,
+        "num_ctx": 4096,
+        "stream": False,
+    },
     "mcp": {"servers": ["npx -y @modelcontextprotocol/server-filesystem"]},
-    "jarvis": {"path": "./jarvis.py", "audio_out": "analog"}  # + ajout: chemin jarvis + préférence sortie audio
+    "jarvis": {
+        "path": "./jarvis.py",
+        "audio_out": "analog",
+        "tts_engine": "piper",
+        "tts_lang": "fr",
+        "wake_word": "jarvis",
+        "wake_aliases": "",
+        "require_wake": True,
+        "wake_fuzzy": True,
+        "wake_fuzzy_score": 80,
+    },
 }
 
 def load_cfg() -> Dict[str, Any]:
@@ -49,6 +81,60 @@ def save_cfg(cfg: Dict[str, Any]):
 CFG = load_cfg()
 
 # -------------- Helpers --------------
+def _maybe_join_voice(base_dir: str, voice: str) -> str:
+    voice = (voice or "").strip()
+    if not voice:
+        return ""
+    if os.path.isabs(voice):
+        return os.path.expanduser(voice)
+    return os.path.join(os.path.expanduser(base_dir or ""), voice)
+
+def _apply_env_from_cfg(cfg: Dict[str, Any]):
+    whisper = cfg.get("whisper", {})
+    jarvis_cfg = cfg.get("jarvis", {})
+    piper_cfg = cfg.get("piper", {})
+    ollama_cfg = cfg.get("ollama", {})
+
+    env_map = {
+        "FW_MODEL": whisper.get("model"),
+        "FW_DEVICE": whisper.get("device"),
+        "FW_COMPUTE": whisper.get("compute"),
+        "FW_LANGUAGE": whisper.get("lang"),
+        "FW_PROMPT": whisper.get("prompt"),
+        "FW_VAD_CMD": "1" if whisper.get("vad") else "0",
+        "FW_VAD_WAKE": "1" if whisper.get("vad") else "0",
+        "WAKE_WORD": jarvis_cfg.get("wake_word"),
+        "WAKE_ALIASES": jarvis_cfg.get("wake_aliases"),
+        "REQUIRE_WAKE": "1" if jarvis_cfg.get("require_wake", True) else "0",
+        "WAKE_FUZZY": "1" if jarvis_cfg.get("wake_fuzzy", True) else "0",
+        "WAKE_FUZZY_SCORE": str(jarvis_cfg.get("wake_fuzzy_score", 80)),
+        "TTS_ENGINE": jarvis_cfg.get("tts_engine"),
+        "TTS_LANG": jarvis_cfg.get("tts_lang"),
+        "AUDIO_OUT": jarvis_cfg.get("audio_out"),
+        "PIPER_VOICE": _maybe_join_voice(piper_cfg.get("base_dir", ""), piper_cfg.get("voice", "")),
+        "PIPER_LENGTH": str(piper_cfg.get("speed", 0.9)),
+        "PIPER_NOISE": str(piper_cfg.get("noise", 0.667)),
+        "PIPER_NOISE_W": str(piper_cfg.get("noise_w", 0.8)),
+        "PIPER_SENT_SIL": str(piper_cfg.get("sentence_silence", 0.10)),
+        "PIPER_CUDA": "1" if piper_cfg.get("use_cuda") else "0",
+        "PIPER_SPEAKER_ID": str(piper_cfg.get("speaker_id")) if piper_cfg.get("speaker_id") is not None else None,
+        "OLLAMA_HOST": ollama_cfg.get("host"),
+        "LLM_ID": ollama_cfg.get("model"),
+        "OLLAMA_TEMPERATURE": str(ollama_cfg.get("temperature", 0.7)),
+        "OLLAMA_NUM_CTX": str(ollama_cfg.get("num_ctx", 4096)),
+        "OLLAMA_STREAM": "1" if ollama_cfg.get("stream") else "0",
+    }
+
+    for key, value in env_map.items():
+        if value is None:
+            os.environ.pop(key, None)
+            continue
+        value_str = str(value).strip()
+        if value_str == "":
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value_str
+
 def fetch_ollama_models(host: str) -> List[str]:
     """List models via /api/tags; return [] on failure."""
     try:
@@ -152,18 +238,24 @@ def _load_jarvis_module(path: str):
     spec.loader.exec_module(mod)  # charge ton jarvis.py
     return mod
 
-def start_jarvis(path: str, audio_out_pref: str = "analog"):
+def start_jarvis(cfg: Dict[str, Any]):
     if st.session_state.jarvis_running:
         st.warning("Jarvis tourne déjà.")
         return
+    jarvis_cfg = cfg.get("jarvis", {})
+    path = jarvis_cfg.get("path", "./jarvis.py")
     if not os.path.exists(path):
         st.error(f"jarvis.py introuvable: {path}")
         return
     try:
+        _apply_env_from_cfg(cfg)
         jarvis = _load_jarvis_module(path)
         st.session_state.jarvis_mod = jarvis
-        # passer la préférence de sortie audio à jarvis via env
-        os.environ["AUDIO_OUT"] = audio_out_pref
+        if hasattr(jarvis, "q_log"):
+            try:
+                jarvis.q_log.put_nowait("[UI] Paramètres synchronisés depuis Streamlit.")
+            except Exception:
+                pass
         def _run():
             try:
                 jarvis.main()  # lance la boucle wake+STT+TTS locale
@@ -329,13 +421,58 @@ with tab_settings:
 
     with t0:
         st.write("**Jarvis (audio local)**")
-        CFG["jarvis"]["path"] = st.text_input("Chemin jarvis.py", value=CFG["jarvis"]["path"])
-        CFG["jarvis"]["audio_out"] = st.text_input("Préférence sortie audio (AUDIO_OUT)", value=CFG["jarvis"]["audio_out"])
+        current_path = CFG["jarvis"].get("path", "./jarvis.py")
+        jarvis_path = st.text_input("Chemin jarvis.py", value=current_path)
+        CFG["jarvis"]["path"] = jarvis_path.strip() or current_path
+        CFG["jarvis"]["audio_out"] = st.text_input(
+            "Préférence sortie audio (AUDIO_OUT)",
+            value=CFG["jarvis"].get("audio_out", "analog"),
+            help="Chaîne partielle du nom du périphérique (ex: analog, speaker, hdmi). Laisser vide pour auto.",
+        ).strip()
+
+        ctts1, ctts2 = st.columns(2)
+        with ctts1:
+            tts_options = ["piper", "fallback"]
+            current_engine = CFG["jarvis"].get("tts_engine", "piper")
+            idx_engine = tts_options.index(current_engine) if current_engine in tts_options else 0
+            CFG["jarvis"]["tts_engine"] = st.selectbox("Moteur TTS", tts_options, index=idx_engine)
+        with ctts2:
+            CFG["jarvis"]["tts_lang"] = st.text_input(
+                "Langue TTS (fallback)", value=CFG["jarvis"].get("tts_lang", "fr")
+            ).strip() or "fr"
+
+        st.markdown("---")
+        wake_col1, wake_col2 = st.columns(2)
+        with wake_col1:
+            CFG["jarvis"]["wake_word"] = st.text_input(
+                "Mot d'activation principal", value=CFG["jarvis"].get("wake_word", "jarvis")
+            ).strip() or "jarvis"
+            CFG["jarvis"]["require_wake"] = st.checkbox(
+                "Nécessite le mot-clé pour écouter",
+                value=bool(CFG["jarvis"].get("require_wake", True)),
+            )
+        with wake_col2:
+            CFG["jarvis"]["wake_fuzzy"] = st.checkbox(
+                "Tolérance phonétique (RapidFuzz)",
+                value=bool(CFG["jarvis"].get("wake_fuzzy", True)),
+            )
+            CFG["jarvis"]["wake_fuzzy_score"] = st.slider(
+                "Score fuzzy minimal",
+                50,
+                100,
+                int(CFG["jarvis"].get("wake_fuzzy_score", 80)),
+            )
+
+        CFG["jarvis"]["wake_aliases"] = st.text_area(
+            "Alias supplémentaires (un par ligne ou séparés par des virgules)",
+            value=CFG["jarvis"].get("wake_aliases", ""),
+            height=80,
+        ).strip()
 
         colJ1, colJ2, colJ3 = st.columns(3)
         with colJ1:
             if st.button("▶️ Démarrer Jarvis"):
-                start_jarvis(CFG["jarvis"]["path"], CFG["jarvis"]["audio_out"])
+                start_jarvis(CFG)
         with colJ2:
             if st.button("⏹️ Arrêter Jarvis"):
                 stop_jarvis()
@@ -354,21 +491,49 @@ with tab_settings:
         st.caption("Astuce: si l’audio sort au mauvais endroit, mets AUDIO_OUT sur une sous-chaîne du nom du périphérique (ex: 'analog', 'hdmi').")
 
     with t1:
+        model_options = ["tiny", "base", "small", "medium", "large-v3"]
+        current_model = CFG["whisper"].get("model", "small")
+        if current_model not in model_options:
+            current_model = "small"
         CFG["whisper"]["model"] = st.selectbox(
-            "Modèle Fast Whisper", ["tiny","base","small","medium","large-v3"],
-            index=["tiny","base","small","medium","large-v3"].index(CFG["whisper"]["model"])
+            "Modèle Fast Whisper", model_options, index=model_options.index(current_model)
         )
-        CFG["whisper"]["lang"]  = st.selectbox("Langue", ["fr","en","auto"], index=["fr","en","auto"].index(CFG["whisper"]["lang"]))
-        CFG["whisper"]["vad"]   = st.checkbox("VAD activé", value=CFG["whisper"]["vad"])
-        CFG["whisper"]["device"]= st.selectbox("Device", ["cpu","cuda"], index=0 if CFG["whisper"]["device"]=="cpu" else 1)
-        CFG["whisper"]["compute"]= st.selectbox(
-            "Compute", ["int8","int8_float16","float16","float32"],
-            index=["int8","int8_float16","float16","float32"].index(CFG["whisper"]["compute"])
+
+        lang_options = ["fr", "en", "auto"]
+        current_lang = CFG["whisper"].get("lang", "fr")
+        if current_lang not in lang_options:
+            current_lang = "fr"
+        CFG["whisper"]["lang"] = st.selectbox("Langue", lang_options, index=lang_options.index(current_lang))
+
+        CFG["whisper"]["vad"] = st.checkbox("VAD activé", value=bool(CFG["whisper"].get("vad", True)))
+
+        device_options = ["cpu", "cuda"]
+        current_device = CFG["whisper"].get("device", "cpu")
+        if current_device not in device_options:
+            current_device = "cpu"
+        CFG["whisper"]["device"] = st.selectbox(
+            "Device", device_options, index=device_options.index(current_device)
         )
+
+        compute_options = ["int8", "int8_float16", "float16", "float32"]
+        current_compute = CFG["whisper"].get("compute", "int8")
+        if current_compute not in compute_options:
+            current_compute = "int8"
+        CFG["whisper"]["compute"] = st.selectbox(
+            "Compute", compute_options, index=compute_options.index(current_compute)
+        )
+
+        CFG["whisper"]["prompt"] = st.text_area(
+            "Prompt initial (contexte)",
+            value=CFG["whisper"].get("prompt", ""),
+            height=100,
+        ).strip()
 
     with t2:
         st.write("**Sélection de la voix Piper**")
-        CFG["piper"]["base_dir"] = st.text_input("Dossier des voix (local serveur)", value=CFG["piper"]["base_dir"])
+        CFG["piper"]["base_dir"] = st.text_input(
+            "Dossier des voix (local serveur)", value=CFG["piper"].get("base_dir", "")
+        ).strip()
         # Uploaders
         up1, up2 = st.columns(2)
         with up1:
@@ -394,9 +559,29 @@ with tab_settings:
         idx_sel = sel_list.index(CFG["piper"].get("voice","")) if CFG["piper"].get("voice","") in sel_list else 0
         sel = st.selectbox("Choisir une voix", sel_list, index=idx_sel)
         CFG["piper"]["voice"] = sel
-        CFG["piper"]["speaker_id"] = st.number_input("Speaker ID", 0, 999, int(CFG["piper"]["speaker_id"]), 1)
-        CFG["piper"]["speed"] = st.number_input("Vitesse (length scale)", 0.5, 2.0, float(CFG["piper"]["speed"]), 0.05)
-        CFG["piper"]["sr"] = st.number_input("Sample rate", 8000, 48000, int(CFG["piper"]["sr"]), 1000)
+        colP1, colP2 = st.columns(2)
+        with colP1:
+            CFG["piper"]["speaker_id"] = st.number_input(
+                "Speaker ID", min_value=0, max_value=999, value=int(CFG["piper"].get("speaker_id", 0)), step=1
+            )
+            CFG["piper"]["use_cuda"] = st.toggle(
+                "Activer CUDA (--cuda)", value=bool(CFG["piper"].get("use_cuda", False))
+            )
+        with colP2:
+            CFG["piper"]["speed"] = st.number_input(
+                "Vitesse (length scale)", min_value=0.5, max_value=2.0,
+                value=float(CFG["piper"].get("speed", 0.9)), step=0.05
+            )
+
+        CFG["piper"]["noise"] = st.slider(
+            "Noise scale", 0.0, 2.0, float(CFG["piper"].get("noise", 0.667)), 0.01
+        )
+        CFG["piper"]["noise_w"] = st.slider(
+            "Noise width", 0.0, 2.0, float(CFG["piper"].get("noise_w", 0.8)), 0.01
+        )
+        CFG["piper"]["sentence_silence"] = st.slider(
+            "Silence inter-phrases (s)", 0.0, 1.0, float(CFG["piper"].get("sentence_silence", 0.10)), 0.01
+        )
 
     with t3:
         st.write("**Ollama**")
