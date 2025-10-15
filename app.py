@@ -292,10 +292,10 @@ def stop_jarvis():
     except Exception as e:
         st.error(f"Stop error: {e}")
 
-def drain_jarvis_logs(max_keep: int = 800):
+def drain_jarvis_logs(max_keep: int = 800) -> List[str]:
     jm = st.session_state.jarvis_mod
     if not jm or not hasattr(jm, "q_log"):
-        return
+        return []
     q = jm.q_log
     pulled = []
     try:
@@ -309,6 +309,23 @@ def drain_jarvis_logs(max_keep: int = 800):
     if pulled:
         st.session_state.jarvis_logbuf += pulled
         st.session_state.jarvis_logbuf = st.session_state.jarvis_logbuf[-max_keep:]
+    return pulled
+
+
+def _update_speaking_state_from_logs(logs: List[str]):
+    if not logs:
+        return
+    now = time.time()
+    for line in logs:
+        if line.strip().startswith("JARVIS:"):
+            st.session_state.last_assistant_ts = now
+            st.session_state.assistant_speaking = True
+            break
+
+
+new_logs = drain_jarvis_logs() if st.session_state.jarvis_running else []
+if new_logs:
+    _update_speaking_state_from_logs(new_logs)
 
 # -------------- CSS --------------
 st.markdown("""
