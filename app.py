@@ -855,23 +855,23 @@ def render_radar(speaking: bool, mode: str):
         .radar-center-circle {{ fill: #0d7a8f; transition: fill .3s ease; }}
         .radar-center-circle.speaking {{ fill: #00d4e8; filter: drop-shadow(0 0 15px rgba(68,241,255,.6)); }}
         .radar-dot {{ fill: #00d4e8; opacity: .9; }}
-        .wave {{ fill: none; stroke: #00d4e8; stroke-width: 2; opacity: .8; animation: none !important; }}
+        .wave {{
+          fill: none;
+          stroke: #00d4e8;
+          stroke-width: 2;
+          opacity: 0;
+          transition: opacity .25s ease;
+        }}
 
-        @keyframes propagate-wave {{
-          0% {{ r:5px; stroke-width:3; opacity:1; stroke:#44f1ff; }}
-          100%{{ r:140px; stroke-width:1; opacity:0; stroke:#00d4e8; }}
+        .radar-container[data-speaking="false"] .wave {{
+          opacity: 0 !important;
         }}
-        @keyframes propagate-wave-2 {{
-          0% {{ r:5px; stroke-width:3; opacity:1; stroke:#44f1ff; }}
-          100%{{ r:140px; stroke-width:1; opacity:0; stroke:#00d4e8; }}
+
+        @media (prefers-reduced-motion: reduce) {{
+          .wave {{
+            transition: none;
+          }}
         }}
-        @keyframes propagate-wave-3 {{
-          0% {{ r:5px; stroke-width:3; opacity:1; stroke:#44f1ff; }}
-          100%{{ r:140px; stroke-width:1; opacity:0; stroke:#00d4e8; }}
-        }}
-        svg.speaking .wave-1 {{ animation: propagate-wave .8s ease-out infinite; }}
-        svg.speaking .wave-2 {{ animation: propagate-wave-2 .8s ease-out infinite .3s; }}
-        svg.speaking .wave-3 {{ animation: propagate-wave-3 .8s ease-out infinite .6s; }}
 
         .radar-status {{
           text-align:center; margin-top:8px; color:#44f1ff; font-size:13px;
@@ -882,7 +882,7 @@ def render_radar(speaking: bool, mode: str):
     <body>
       <div class="wrap">
         <h3 class="title">Radar Vocal</h3>
-        <div class="radar-container">
+        <div class="radar-container" data-speaking="{str(bool(speaking)).lower()}">
           <svg class="{svg_cls}" viewBox="0 0 300 300" preserveAspectRatio="xMidYMid meet">
             <defs>
               <filter id="glow">
@@ -903,9 +903,9 @@ def render_radar(speaking: bool, mode: str):
             <line x1="150" y1="10"  x2="150" y2="290" stroke="#00d4e8" stroke-width="1" opacity="0.2"/>
 
             <g id="waves">
-              <circle class="wave wave-1" cx="150" cy="150" r="5" filter="url(#glow)"/>
-              <circle class="wave wave-2" cx="150" cy="150" r="5" filter="url(#glow)"/>
-              <circle class="wave wave-3" cx="150" cy="150" r="5" filter="url(#glow)"/>
+              <circle class="wave wave-1" cx="150" cy="150" r="35" filter="url(#glow)"/>
+              <circle class="wave wave-2" cx="150" cy="150" r="35" filter="url(#glow)"/>
+              <circle class="wave wave-3" cx="150" cy="150" r="35" filter="url(#glow)"/>
             </g>
 
             <circle class="radar-center-circle {center_cls}" cx="150" cy="150" r="28"/>
@@ -926,6 +926,95 @@ def render_radar(speaking: bool, mode: str):
         </div>
         <div class="radar-status">{label}</div>
       </div>
+      <script>
+        (() => {{
+          const container = document.querySelector('.radar-container');
+          if (!container) {{ return; }}
+          const svg = container.querySelector('svg');
+          const waves = Array.from(svg.querySelectorAll('.wave'));
+          if (!waves.length) {{ return; }}
+
+          const MIN_RADIUS = 35;
+          const MAX_RADIUS = 140;
+          const CYCLE_MS = 1800;
+          const OFFSET_MS = CYCLE_MS / waves.length;
+
+          let speaking = svg.classList.contains('speaking');
+          let lastToggleTs = performance.now();
+
+          const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+          let prefersReducedMotion = reducedMotionQuery.matches;
+
+          const handleReducedMotion = (event) => {{
+            prefersReducedMotion = event.matches;
+            if (prefersReducedMotion) {{
+              container.setAttribute('data-speaking', 'false');
+              waves.forEach((wave) => {{
+                wave.setAttribute('r', MIN_RADIUS.toString());
+                wave.style.opacity = '0';
+              }});
+            }} else {{
+              lastToggleTs = performance.now();
+            }}
+          }};
+
+          if (reducedMotionQuery.addEventListener) {{
+            reducedMotionQuery.addEventListener('change', handleReducedMotion);
+          }} else if (reducedMotionQuery.addListener) {{
+            reducedMotionQuery.addListener(handleReducedMotion);
+          }}
+
+          handleReducedMotion(reducedMotionQuery);
+
+          const syncSpeakingState = () => {{
+            const nextState = svg.classList.contains('speaking');
+            if (nextState !== speaking) {{
+              speaking = nextState;
+              container.setAttribute('data-speaking', String(speaking));
+              if (speaking) {{
+                lastToggleTs = performance.now();
+              }} else {{
+                waves.forEach((wave) => {{
+                  wave.setAttribute('r', MIN_RADIUS.toString());
+                  wave.style.opacity = '0';
+                }});
+              }}
+            }}
+          }};
+
+          const observer = new MutationObserver(syncSpeakingState);
+          observer.observe(svg, {{ attributes: true, attributeFilter: ['class'] }});
+          syncSpeakingState();
+
+          const animate = (now) => {{
+            if (prefersReducedMotion) {{
+              requestAnimationFrame(animate);
+              return;
+            }}
+
+            syncSpeakingState();
+            waves.forEach((wave, index) => {{
+              const elapsed = now - lastToggleTs - (index * OFFSET_MS);
+              if (!speaking || elapsed < 0) {{
+                wave.setAttribute('r', MIN_RADIUS.toString());
+                wave.style.opacity = '0';
+                return;
+              }}
+
+              const progress = (elapsed % CYCLE_MS) / CYCLE_MS;
+              const radius = MIN_RADIUS + (MAX_RADIUS - MIN_RADIUS) * progress;
+              const opacity = Math.max(0, 1 - progress);
+
+              wave.setAttribute('r', radius.toFixed(2));
+              wave.style.opacity = opacity.toFixed(2);
+            }});
+
+            requestAnimationFrame(animate);
+          }};
+
+          requestAnimationFrame(animate);
+        }})();
+      </script>
     </body>
     </html>
     """
