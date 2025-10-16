@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, io, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex
-from typing import List, Dict, Any, Optional
-
+import os, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex, asyncio
+from typing import List, Dict, Any, Optional, Tuple, Union
 import streamlit as st
 import requests
+import streamlit.components.v1 as components  # <- pour l'iframe HTML du radar
 
 st.set_page_config(page_title="Jarvis — Streamlit UI (style shadcn) v3", layout="wide")
 
 # -------------- Persistence --------------
 CONFIG_DIR = os.path.expanduser("~/.jarvis")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "ui_config.json")
-
 DEFAULT_CFG: Dict[str, Any] = {
     "whisper": {
         "model": "small",
@@ -39,17 +38,17 @@ DEFAULT_CFG: Dict[str, Any] = {
         "stream": False,
     },
     "mcp": {
-        "servers": [
-            {
-                "id": "filesystem",
-                "name": "Filesystem",
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem"],
-                "env": {},
-                "enabled": True,
-                "auto_start": True,
-            }
-        ]
+        "servers": [],
+        "proxy": {
+            "enabled": True,
+            "command": "node",
+            "args": ["/ABSOLU/adamwattis_mcp-proxy-server/build/index.js"],
+            "env": {},
+            "tool_timeout_s": 60,
+            "chat_shortcuts": True,
+            "auto_web": False,
+            "auto_web_topk": 5
+        },
     },
     "jarvis": {
         "path": "./jarvis.py",
@@ -64,12 +63,11 @@ DEFAULT_CFG: Dict[str, Any] = {
     },
 }
 
-# --- dossier logs MCP
 MCP_LOG_DIR = os.path.join(CONFIG_DIR, "mcp-logs")
 os.makedirs(MCP_LOG_DIR, exist_ok=True)
 
 def _normalize_mcp_servers(cfg: Dict[str, Any]) -> None:
-    """Ensure MCP server configs are dict-based and fill defaults."""
+    """Normalize 'mcp.servers' et 'mcp.proxy' dict."""
     mcp = cfg.setdefault("mcp", {})
     servers = mcp.get("servers", []) or []
     normalized: List[Dict[str, Any]] = []
@@ -118,13 +116,24 @@ def _normalize_mcp_servers(cfg: Dict[str, Any]) -> None:
             server["env"] = {}
         normalized.append(server)
     mcp["servers"] = normalized
+    proxy = mcp.get("proxy", {}) or {}
+    mcp["proxy"] = {
+        "enabled": bool(proxy.get("enabled", False)),
+        "command": str(proxy.get("command", "")),
+        "args": proxy.get("args") or [],
+        "env": proxy.get("env") or {},
+        "tool_timeout_s": int(proxy.get("tool_timeout_s", 60)),
+        "chat_shortcuts": bool(proxy.get("chat_shortcuts", True)),
+        "auto_web": bool(proxy.get("auto_web", False)),
+        "auto_web_topk": int(proxy.get("auto_web_topk", 5)),
+    }
 
 def load_cfg() -> Dict[str, Any]:
+    """Charge la config depuis le fichier ou retourne la config par défaut."""
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # shallow-merge with defaults
                 cfg = DEFAULT_CFG.copy()
                 for k, v in (data or {}).items():
                     if isinstance(v, dict):
@@ -140,7 +149,11 @@ def load_cfg() -> Dict[str, Any]:
     return cfg
 
 def save_cfg(cfg: Dict[str, Any]):
+    """Sauvegarde la config (avec validation minimale)."""
     try:
+        if not isinstance(cfg, dict):
+            st.error("Config invalide: doit être un dictionnaire.")
+            return
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -160,11 +173,11 @@ def _maybe_join_voice(base_dir: str, voice: str) -> str:
     return os.path.join(os.path.expanduser(base_dir or ""), voice)
 
 def _apply_env_from_cfg(cfg: Dict[str, Any]):
+    """Applique les variables d'environnement depuis la config."""
     whisper = cfg.get("whisper", {})
     jarvis_cfg = cfg.get("jarvis", {})
     piper_cfg = cfg.get("piper", {})
     ollama_cfg = cfg.get("ollama", {})
-
     env_map = {
         "FW_MODEL": whisper.get("model"),
         "FW_DEVICE": whisper.get("device"),
@@ -195,7 +208,6 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
         "OLLAMA_STREAM": "1" if ollama_cfg.get("stream") else "0",
         "MCP_SERVERS_JSON": json.dumps(cfg.get("mcp", {}).get("servers", []), ensure_ascii=False),
     }
-
     for key, value in env_map.items():
         if value is None:
             os.environ.pop(key, None)
@@ -207,7 +219,7 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
             os.environ[key] = value_str
 
 def fetch_ollama_models(host: str) -> List[str]:
-    """List models via /api/tags; return [] on failure."""
+    """Récupère la liste des modèles Ollama disponibles."""
     try:
         url = host.rstrip("/") + "/api/tags"
         r = requests.get(url, timeout=5)
@@ -223,6 +235,7 @@ def fetch_ollama_models(host: str) -> List[str]:
         return []
 
 def is_ollama_up(host: str) -> bool:
+    """Vérifie si Ollama est accessible."""
     try:
         url = host.rstrip("/") + "/api/tags"
         r = requests.get(url, timeout=3)
@@ -231,6 +244,7 @@ def is_ollama_up(host: str) -> bool:
         return False
 
 def _build_ollama_chat_messages(messages):
+    """Construit la liste des messages au format Ollama."""
     mapped = []
     for m in messages[-20:]:
         role = m.get("role", "user")
@@ -245,6 +259,7 @@ def _build_ollama_chat_messages(messages):
     return mapped
 
 def ollama_reply(cfg, messages) -> str:
+    """Obtient une réponse d'Ollama."""
     host = cfg["ollama"]["host"]
     model = cfg["ollama"]["model"]
     options = {
@@ -253,8 +268,6 @@ def ollama_reply(cfg, messages) -> str:
     }
     if not is_ollama_up(host):
         return "Ollama est indisponible (API /api/tags KO)."
-
-    # Essai principal : /api/chat
     try:
         url = host.rstrip("/") + "/api/chat"
         payload = {
@@ -268,7 +281,6 @@ def ollama_reply(cfg, messages) -> str:
         data = r.json() or {}
         return (data.get("message") or {}).get("content") or ""
     except Exception:
-        # Repli : /api/generate avec le dernier message user
         try:
             last_user = next((m["content"] for m in reversed(messages) if m.get("role")=="user"), "")
             url = host.rstrip("/") + "/api/generate"
@@ -281,6 +293,7 @@ def ollama_reply(cfg, messages) -> str:
             return f"Erreur Ollama: {e2}"
 
 def start_ollama_daemon(log_path: Optional[str] = None) -> bool:
+    """Lance le daemon Ollama."""
     try:
         kwargs = {}
         if log_path:
@@ -294,6 +307,7 @@ def start_ollama_daemon(log_path: Optional[str] = None) -> bool:
         return False
 
 def wait_ollama_ready(host: str, seconds: int = 10) -> bool:
+    """Attend que Ollama soit prêt."""
     t0 = time.time()
     while time.time() - t0 < seconds:
         if is_ollama_up(host):
@@ -302,6 +316,7 @@ def wait_ollama_ready(host: str, seconds: int = 10) -> bool:
     return False
 
 def pull_model(model: str) -> bool:
+    """Télécharge un modèle Ollama."""
     try:
         proc = subprocess.run(["ollama", "pull", model], capture_output=True, text=True, check=True)
         st.text(proc.stdout or "pull: ok")
@@ -313,6 +328,7 @@ def pull_model(model: str) -> bool:
         return False
 
 def warmup_model(host: str, model: str) -> bool:
+    """Charge un modèle en mémoire."""
     try:
         url = host.rstrip("/") + "/api/generate"
         payload = {"model": model, "prompt": "ok", "stream": False}
@@ -325,6 +341,7 @@ def warmup_model(host: str, model: str) -> bool:
         return False
 
 def save_uploaded(file, dest_dir: str) -> Optional[str]:
+    """Sauvegarde un fichier uploadé."""
     try:
         os.makedirs(dest_dir, exist_ok=True)
         path = os.path.join(dest_dir, file.name)
@@ -335,9 +352,123 @@ def save_uploaded(file, dest_dir: str) -> Optional[str]:
         st.error(f"Enregistrement échoué: {e}")
         return None
 
-# -------------- gestion des serveurs MCP (spawn/stop/probe) --------------
+# -------------- MCP: client helpers (stdio & proxy) --------------
+def _mcp_import_ok() -> bool:
+    """Vérifie si le SDK MCP est disponible."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("mcp") is not None
+    except Exception:
+        return False
+
+def _fmt_call_result(result: Any) -> str:
+    """Convertit un CallToolResult en texte lisible."""
+    try:
+        from mcp import types
+    except Exception:
+        return json.dumps(getattr(result, "__dict__", str(result)), ensure_ascii=False, indent=2)
+    parts: List[str] = []
+    sc = getattr(result, "structuredContent", None)
+    if sc not in (None, {}):
+        try:
+            parts.append(json.dumps(sc, ensure_ascii=False, indent=2))
+        except Exception:
+            parts.append(str(sc))
+    for c in getattr(result, "content", []) or []:
+        try:
+            from mcp import types as _t
+        except Exception:
+            _t = None
+        if _t and isinstance(c, _t.TextContent):
+            parts.append(c.text)
+        elif _t and isinstance(c, _t.EmbeddedResource):
+            res = c.resource
+            uri = getattr(res, "uri", "")
+            if hasattr(res, "text"):
+                parts.append(f"[resource {uri}]\n{res.text}")
+            else:
+                parts.append(f"[resource {uri}] (binaire)")
+        else:
+            parts.append(str(c))
+    if getattr(result, "isError", False) and not parts:
+        parts.append("[MCP] Tool execution failed.")
+    out = "\n".join([p for p in parts if p]) or "(vide)"
+    return out
+
+def _merge_env(env: Optional[Dict[str,str]]) -> Dict[str,str]:
+    """Fusionne l'env fourni avec l'env courant."""
+    merged = os.environ.copy()
+    for k, v in (env or {}).items():
+        merged[str(k)] = str(v)
+    return merged
+
+def mcp_list_tools_via_stdio(command: str, args: List[str], env: Dict[str, str]) -> List[str]:
+    """Liste les tools d'un serveur MCP via stdio."""
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    merged_env = _merge_env(env)
+    cfg_path = merged_env.get("MCP_CONFIG_PATH")
+    if cfg_path and not os.path.isfile(cfg_path):
+        raise FileNotFoundError(f"[MCP] MCP_CONFIG_PATH introuvable: {cfg_path}")
+    params = StdioServerParameters(command=command, args=args or [], env=merged_env)
+    async def _go():
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as sess:
+                await sess.initialize()
+                resp = await sess.list_tools()
+                return [t.name for t in (resp.tools or [])]
+    return asyncio.run(_go())
+
+def mcp_call_tool_via_stdio(command: str, args: List[str], env: Dict[str, str],
+                            tool: str, arguments: Dict[str, Any], timeout_s: int = 60) -> str:
+    """Appelle un tool via un process stdio éphémère."""
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    merged_env = _merge_env(env)
+    cfg_path = merged_env.get("MCP_CONFIG_PATH")
+    if cfg_path and not os.path.isfile(cfg_path):
+        return f"[MCP] MCP_CONFIG_PATH introuvable: {cfg_path}"
+    params = StdioServerParameters(command=command, args=args or [], env=merged_env)
+    async def _go():
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as sess:
+                await sess.initialize()
+                try:
+                    res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
+                except asyncio.TimeoutError:
+                    return "[MCP] Timeout d'exécution du tool."
+                return _fmt_call_result(res)
+    return asyncio.run(_go())
+
+# --- shortcuts haut-niveau (DDG) ---
+def _proxy_cfg() -> Dict[str, Any]:
+    return CFG.get("mcp", {}).get("proxy", {}) or {}
+
+def ddg_search(query: str, topk: int = 5) -> str:
+    """Recherche via DuckDuckGo via MCP proxy."""
+    p = _proxy_cfg()
+    try:
+        args = {"query": query, "max_results": int(topk)}
+        out = mcp_call_tool_via_stdio(p.get("command",""), p.get("args") or [], p.get("env") or {},
+                                      "search", args, timeout_s=int(p.get("tool_timeout_s",60)))
+        return out or "(vide)"
+    except Exception as e:
+        return f"[MCP/search] {e}"
+
+def ddg_fetch(url: str) -> str:
+    """Récupère le contenu d'une URL via MCP proxy."""
+    p = _proxy_cfg()
+    try:
+        args = {"url": url}
+        out = mcp_call_tool_via_stdio(p.get("command",""), p.get("args") or [], p.get("env") or {},
+                                      "fetch_content", args, timeout_s=int(p.get("tool_timeout_s",60)))
+        return out or "(vide)"
+    except Exception as e:
+        return f"[MCP/fetch_content] {e}"
+
+# -------------- gestion des serveurs MCP (spawn/stop/probe legacy) --------------
 if "mcp_procs" not in st.session_state:
-    st.session_state.mcp_procs = {}   # id -> Popen
+    st.session_state.mcp_procs = {}
 if "mcp_autostart_done" not in st.session_state:
     st.session_state.mcp_autostart_done = False
 
@@ -350,6 +481,7 @@ def _server_cmd(s: Dict[str, Any]) -> List[str]:
     return [cmd] + [a for a in args if a]
 
 def _spawn_mcp_server(s: Dict[str, Any]) -> bool:
+    """Démarre un serveur MCP."""
     sid = _server_key(s)
     p = st.session_state.mcp_procs.get(sid)
     if p and p.poll() is None:
@@ -373,6 +505,7 @@ def _spawn_mcp_server(s: Dict[str, Any]) -> bool:
         return False
 
 def _stop_mcp_server(sid: str):
+    """Arrête un serveur MCP."""
     p = st.session_state.mcp_procs.get(sid)
     if not p:
         return
@@ -386,31 +519,20 @@ def _stop_mcp_server(sid: str):
         st.session_state.mcp_procs.pop(sid, None)
 
 def _mcp_running(sid: str) -> bool:
+    """Vérifie si un serveur MCP est en cours d'exécution."""
     p = st.session_state.mcp_procs.get(sid)
     return bool(p and p.poll() is None)
 
 def _probe_mcp_tools(s: Dict[str, Any]) -> Optional[List[str]]:
-    try:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-    except Exception:
-        st.warning("SDK MCP Python introuvable (`pip install modelcontextprotocol`).")
+    """Teste les tools d'un serveur MCP."""
+    if not _mcp_import_ok():
+        st.warning("SDK MCP Python introuvable (`pip install mcp` ou `pip install modelcontextprotocol`).")
         return None
-    params = StdioServerParameters(
-        command=s.get("command"),
-        args=s.get("args") or [],
-        env=s.get("env") or {},
-    )
-
-    async def _go():
-        async with stdio_client(params) as (r, w):
-            async with ClientSession(r, w) as sess:
-                await sess.initialize()
-                lst = await sess.list_tools()
-                return [t.name for t in (lst.tools or [])]
-
-    import asyncio
-    return asyncio.run(_go())
+    try:
+        return mcp_list_tools_via_stdio(s.get("command",""), s.get("args") or [], s.get("env") or {})
+    except Exception as e:
+        st.error(f"Probe tools a échoué: {e}")
+        return None
 
 # -------------- Jarvis runtime (local) --------------
 if "jarvis_mod" not in st.session_state:
@@ -427,27 +549,28 @@ if "last_assistant_ts" not in st.session_state:
     st.session_state.last_assistant_ts = 0.0
 if "assistant_speaking" not in st.session_state:
     st.session_state.assistant_speaking = False
-if "previous_interaction_mode" not in st.session_state:
-    st.session_state.previous_interaction_mode = st.session_state.interaction_mode
 if "mode_toggle" not in st.session_state:
-    st.session_state.mode_toggle = st.session_state.interaction_mode == "vocal"
+    st.session_state.mode_toggle = False
+if "auto_refresh_chat" not in st.session_state:
+    st.session_state.auto_refresh_chat = False  # désactivé par défaut (évite blocage boutons)
 
 def _set_interaction_mode(mode: str):
+    """Définit le mode d'interaction (vocal ou chat)."""
     mode = "vocal" if mode == "vocal" else "chat"
     if mode != st.session_state.interaction_mode and mode == "vocal":
-        # nettoyer la saisie AVANT instanciation du widget (à la prochaine relance)
         st.session_state["chat_input"] = ""
     st.session_state.interaction_mode = mode
-    st.session_state.previous_interaction_mode = mode
     st.session_state.mode_toggle = mode == "vocal"
 
 def _sync_mode_from_toggle():
+    """Synchronise le mode depuis le toggle."""
     desired = "vocal" if st.session_state.get("mode_toggle") else "chat"
     _set_interaction_mode(desired)
 
 _set_interaction_mode(st.session_state.interaction_mode)
 
 def _load_jarvis_module(path: str):
+    """Charge le module jarvis.py."""
     spec = importlib.util.spec_from_file_location("jarvis", path)
     if not spec or not spec.loader:
         raise RuntimeError("Impossible de charger jarvis.py")
@@ -456,6 +579,7 @@ def _load_jarvis_module(path: str):
     return mod
 
 def start_jarvis(cfg: Dict[str, Any]):
+    """Démarre Jarvis en arrière-plan."""
     if st.session_state.jarvis_running:
         st.warning("Jarvis tourne déjà.")
         return
@@ -492,6 +616,7 @@ def start_jarvis(cfg: Dict[str, Any]):
         st.error(f"Erreur au démarrage de Jarvis: {e}")
 
 def stop_jarvis():
+    """Arrête Jarvis."""
     if not st.session_state.jarvis_running or not st.session_state.jarvis_mod:
         st.info("Jarvis n'est pas en cours.")
         return
@@ -502,13 +627,14 @@ def stop_jarvis():
         st.error(f"Stop error: {e}")
 
 def drain_jarvis_logs(max_keep: int = 800) -> List[str]:
+    """Vide la queue de logs de Jarvis."""
     jm = st.session_state.jarvis_mod
     if not jm or not hasattr(jm, "q_log"):
         return []
     q = jm.q_log
     pulled = []
     try:
-        for _ in range(500):
+        while True:
             try:
                 pulled.append(q.get_nowait())
             except queue.Empty:
@@ -521,6 +647,7 @@ def drain_jarvis_logs(max_keep: int = 800) -> List[str]:
     return pulled
 
 def _update_speaking_state_from_logs(logs: List[str]):
+    """Met à jour l'état parlant depuis les logs."""
     if not logs:
         return
     now = time.time()
@@ -534,8 +661,9 @@ new_logs = drain_jarvis_logs() if st.session_state.jarvis_running else []
 if new_logs:
     _update_speaking_state_from_logs(new_logs)
 
-# ---- parsing des logs + mise à jour messages
+# ---- parsing des logs + mise à jour messages ----
 def _ingest_chat_from_logs(logs: List[str]):
+    """Ingère les messages chat depuis les logs."""
     if not logs:
         return
     msgs = st.session_state.setdefault("messages", [])
@@ -564,19 +692,33 @@ def _ingest_chat_from_logs(logs: List[str]):
 
 _ingest_chat_from_logs(new_logs)
 
+# -------------- ORT providers (affichage dans topbar) --------------
+def _ort_providers() -> Tuple[List[str], str]:
+    try:
+        import onnxruntime as ort
+        provs = list(ort.get_available_providers())
+        # Renvoie un label lisible
+        label = "CPU"
+        if "TensorrtExecutionProvider" in provs:
+            label = "TensorRT"
+        elif "CUDAExecutionProvider" in provs:
+            label = "CUDA"
+        return provs, label
+    except Exception as e:
+        return [], f"ERR: {getattr(e, '__class__', type(e)).__name__}"
+
 # -------------- CSS --------------
 st.markdown("""
 <style>
 :root{
   --bg: #0b0f14; --panel: #0e141b; --muted: #121923; --border: #1b2633;
   --primary: #44f1ff; --primary-2: #00c2d1; --fg: #e6f1ff; --muted-fg:#7b8ba1; --accent:#101926;
-  --ok: #2ecc71;   /* vert */
-  --bad: #e74c3c;  /* rouge */
+  --ok: #2ecc71; --bad: #e74c3c;
 }
 .main .block-container{ padding-top: 0rem; }
 body{
   background: radial-gradient(900px 450px at 50% 28%, rgba(0, 194, 209, 0.08), transparent 55%),
-              radial-gradient(700px 400px at 70% 20%, rgba(68, 241, 255, 0.05), transparent 60%),
+              radial-gradient(700px 400px at 70% 20%, rgba(68,241,255,0.05), transparent 60%),
               linear-gradient(180deg, #0b0f14 0%, #0a0e13 100%);
   color: var(--fg);
 }
@@ -595,31 +737,19 @@ body::before{
 .status-left{ display:flex; gap:16px; align-items:center; }
 .pill{ display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px;
   background: linear-gradient(180deg, var(--panel), var(--muted)); border: 1px solid var(--border);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  font-size: 12px; color: var(--fg); }
+  font-family: ui-monospace; font-size: 12px; color: var(--fg); }
 .dot{ width:8px; height:8px; border-radius:999px; opacity:.95 }
-.dot.ok{
-  background: var(--ok);
-  box-shadow: 0 0 12px rgba(46,204,113,.9), 0 0 30px rgba(46,204,113,.35);
-  animation: pulse 1.6s ease-in-out infinite;
-}
-.dot.bad{
-  background: var(--bad);
-  box-shadow: 0 0 12px rgba(231,76,60,.9), 0 0 30px rgba(231,76,60,.35);
-}
+.dot.ok{ background: var(--ok); box-shadow: 0 0 12px rgba(46,204,113,.9), 0 0 30px rgba(46,204,113,.35); animation: pulse 1.6s ease-in-out infinite; }
+.dot.bad{ background: var(--bad); box-shadow: 0 0 12px rgba(231,76,60,.9), 0 0 30px rgba(231,76,60,.35); }
 @keyframes pulse{0%{transform:scale(.9);opacity:.8}50%{transform:scale(1.2);opacity:1}100%{transform:scale(.9);opacity:.8}}
-.card{ background: linear-gradient(180deg, var(--panel), var(--muted)); border: 1px solid var(--border);
-  border-radius: 14px; padding: 14px; }
+.card{ background: linear-gradient(180deg, var(--panel), var(--muted)); border: 1px solid var(--border); border-radius: 14px; padding: 14px; }
 .card h3{ margin: 0 0 8px 0; color: var(--fg); }
 .muted{ color: var(--muted-fg); }
-
-/* Chat */
 .chat-card{ display:flex; flex-direction:column; }
 .chat-card-body{ display:flex; flex-direction:column; gap:14px; }
 .chat-wrap{ display:flex; flex-direction:column; height:520px; }
 .msgs{ flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; padding-right:6px; min-width:0; }
-.bubble{ max-width: 92%; padding:10px 12px; border-radius: 12px; border: 1px solid var(--border);
-         min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; text-overflow:clip; }
+.bubble{ max-width: 92%; padding:10px 12px; border-radius: 12px; border: 1px solid var(--border); white-space:pre-wrap; overflow-wrap:anywhere; }
 .user{ align-self:flex-end; background: rgba(68,241,255,0.08); }
 .assistant{ align-self:flex-start; background: rgba(255,255,255,0.04); }
 .chat-toggle{ margin-top:8px; }
@@ -627,61 +757,11 @@ body::before{
 .chat-toggle [data-testid="stToggle"] label{ color: var(--fg); font-weight:600; }
 .chat-toggle [data-testid="stToggle"] [data-testid="stTickBar"]{ background: var(--primary); }
 .chat-input input{ background: var(--accent) !important; color: var(--fg) !important; border:1px solid var(--border); border-radius: 10px; padding:10px 12px; }
-.chat-send button{ background: linear-gradient(180deg, #0b485b, #083947); border:1px solid var(--primary-2); color: white; border-radius: 10px; padding:10px 14px; cursor:pointer; }
-.chat-send button:disabled{ background: linear-gradient(180deg, #1a222d, #121a24); border-color: var(--border); color: var(--muted-fg); cursor:not-allowed; }
-
-/* Visualizer */
-.visualizer{ position:relative; width:min(100%, 360px); aspect-ratio: 1 / 1; margin: 16px auto 0;
-  display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:50%;
-  background: radial-gradient(320px 320px at 50% 50%, rgba(68,241,255,0.08), transparent 70%);
-  border: 1px dashed rgba(255,255,255,0.08); transform: translateZ(0); transition: box-shadow .3s ease; }
-.visualizer::after{ content:""; position:absolute; inset:12%; border-radius:50%;
-  border:1px solid rgba(68,241,255,0.12); box-shadow: inset 0 0 20px rgba(68,241,255,0.05);
-  pointer-events:none; }
-.visualizer.speaking{ box-shadow: 0 0 32px rgba(68,241,255,0.35); animation: radarVibrate .45s ease-in-out infinite; }
-.equalizer{ position:absolute; bottom:22%; left:50%; transform:translateX(-50%);
-  display:flex; align-items:flex-end; justify-content:center; gap:6px; width:64px; height:26%;
-  opacity:0.0; transition: opacity .25s ease; }
-.visualizer.speaking .equalizer{ opacity:1; }
-.equalizer .bar{ flex:1; height:25%; border-radius:999px; background:rgba(68,241,255,0.55);
-  transform-origin:center bottom; transform:scaleY(.35); filter: drop-shadow(0 0 6px rgba(68,241,255,0.45));
-  transition: transform .25s ease; }
-.equalizer .bar::after{ content:""; display:block; width:100%; height:100%; border-radius:inherit;
-  background: linear-gradient(180deg, rgba(68,241,255,0.85) 0%, rgba(0,194,209,0.35) 100%);
-  opacity:.85; }
-.visualizer.speaking .equalizer .bar{ animation: eqDance 0.95s ease-in-out infinite; }
-.visualizer.speaking .equalizer .b2{ animation-duration: 0.82s; animation-delay: .08s; }
-.visualizer.speaking .equalizer .b3{ animation-duration: 1.05s; animation-delay: .14s; }
-.visualizer.speaking .equalizer .b4{ animation-duration: 0.78s; animation-delay: .2s; }
-.visualizer.speaking .equalizer .b5{ animation-duration: 0.98s; animation-delay: .26s; }
-.ring{ position:absolute; top:50%; left:50%; transform:translate(-50%, -50%);
-  border:1px solid rgba(68,241,255,0.22); border-radius:50%; animation: ringPulse 2.4s ease-in-out infinite; }
-.visualizer.speaking .ring{ border-color: rgba(68,241,255,0.4); animation-duration: 1.6s; box-shadow: 0 0 18px rgba(68,241,255,0.18); }
-.r1{ width:36%; height:36%; animation-delay: 0s; }
-.r2{ width:58%; height:58%; animation-delay: .18s; }
-.r3{ width:80%; height:80%; animation-delay: .36s; }
-@keyframes ringPulse{ 0%{ box-shadow: 0 0 0 0 rgba(68,241,255,0.18); opacity:.6; }
-  50%{ box-shadow: 0 0 24px 0 rgba(68,241,255,0.45), inset 0 0 22px rgba(68,241,255,0.12); opacity:1; }
-  100%{ box-shadow: 0 0 0 0 rgba(68,241,255,0.18); opacity:.6; } }
-@keyframes radarVibrate{ 0%{ transform: translateZ(0) scale(1); }
-  35%{ transform: translateZ(0) scale(1.035); }
-  65%{ transform: translateZ(0) scale(1.02); }
-  100%{ transform: translateZ(0) scale(1); }
-}
-@keyframes eqDance{
-  0%, 100%{ transform: scaleY(.25); }
-  30%{ transform: scaleY(.95); }
-  55%{ transform: scaleY(.55); }
-  75%{ transform: scaleY(1.2); }
-}
-.radar-label{ position:absolute; inset:auto; top:50%; left:50%; transform:translate(-50%, -50%);
-  padding:8px 12px; border-radius:999px; background:rgba(11,15,20,0.75); border:1px solid rgba(68,241,255,0.35);
-  font-size:13px; letter-spacing:1px; text-transform:uppercase; color:var(--primary); }
-.visualizer.speaking .radar-label{ color:#0b0f14; background:rgba(68,241,255,0.85); }
+.chat-send button{ background: linear-gradient(180deg, #0b485b, #083947); border:1px solid var(--primary-2); color: white; border-radius: 10px; padding:10px 14px; }
 </style>
 """, unsafe_allow_html=True)
 
-# -------------- Top bar (dynamique : pastilles vert/rouge) --------------
+# -------------- Top bar --------------
 def _pill_html(name: str, ok: bool, label: str) -> str:
     cls = "dot ok" if ok else "dot bad"
     safe_label = html.escape(label)
@@ -707,6 +787,11 @@ voice_path = _maybe_join_voice(CFG["piper"].get("base_dir", ""), CFG["piper"].ge
 piper_ok = jarvis_running and CFG["jarvis"].get("tts_engine") == "piper" and voice_path and os.path.exists(voice_path)
 piper_label = "Ready" if piper_ok else "Off"
 
+# ORT (ONNX Runtime) status
+ort_provs, ort_label = _ort_providers()
+ort_ok = bool(ort_provs)
+pill_ort = _pill_html("ONNXRT", ort_ok, ort_label)
+
 pill_whisper = _pill_html("WHISPER", whisper_ok, whisper_label)
 pill_piper   = _pill_html("PIPER",   piper_ok,   piper_label)
 pill_ollama  = _pill_html("OLLAMA",  ollama_up,  ollama_status)
@@ -721,6 +806,7 @@ st.markdown(
       {pill_piper}
       {pill_ollama}
       {pill_mcp}
+      {pill_ort}
     </div>
     <div></div>
   </div>
@@ -729,7 +815,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# -------------- Auto-start MCP (une seule fois par session) --------------
+# -------------- Auto-start MCP legacy (une seule fois par session) --------------
 if not st.session_state.mcp_autostart_done:
     _apply_env_from_cfg(CFG)
     for _s in CFG.get("mcp", {}).get("servers", []):
@@ -737,9 +823,118 @@ if not st.session_state.mcp_autostart_done:
             _spawn_mcp_server(_s)
     st.session_state.mcp_autostart_done = True
 
+# ---------- Helper pour afficher le radar (dans un composant HTML dédié) ----------
+def render_radar(speaking: bool, mode: str):
+    svg_cls = "speaking" if speaking else ""
+    center_cls = "speaking" if speaking else ""
+    label = "Mode vocal" if mode == "vocal" else "Mode chat"
+
+    html_snippet = f"""
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <style>
+        body {{
+          margin: 0; padding: 0;
+          background: transparent;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }}
+        .wrap {{
+          background: linear-gradient(180deg, #0e141b, #121923);
+          border: 1px solid #1b2633;
+          border-radius: 14px;
+          padding: 14px;
+        }}
+        .title {{ color: #e6f1ff; margin: 0 0 8px 0; font-weight: 600; }}
+        .radar-container {{
+          position: relative; width: min(100%, 400px); aspect-ratio: 1;
+          display: flex; align-items: center; justify-content: center; margin: 0 auto;
+          filter: drop-shadow(0 0 20px rgba(68,241,255,.20));
+        }}
+        svg {{ width: 100%; height: 100%; }}
+        .radar-center-circle {{ fill: #0d7a8f; transition: fill .3s ease; }}
+        .radar-center-circle.speaking {{ fill: #00d4e8; filter: drop-shadow(0 0 15px rgba(68,241,255,.6)); }}
+        .radar-dot {{ fill: #00d4e8; opacity: .9; }}
+        .wave {{ fill: none; stroke: #00d4e8; stroke-width: 2; opacity: .8; animation: none !important; }}
+
+        @keyframes propagate-wave {{
+          0% {{ r:5px; stroke-width:3; opacity:1; stroke:#44f1ff; }}
+          100%{{ r:140px; stroke-width:1; opacity:0; stroke:#00d4e8; }}
+        }}
+        @keyframes propagate-wave-2 {{
+          0% {{ r:5px; stroke-width:3; opacity:1; stroke:#44f1ff; }}
+          100%{{ r:140px; stroke-width:1; opacity:0; stroke:#00d4e8; }}
+        }}
+        @keyframes propagate-wave-3 {{
+          0% {{ r:5px; stroke-width:3; opacity:1; stroke:#44f1ff; }}
+          100%{{ r:140px; stroke-width:1; opacity:0; stroke:#00d4e8; }}
+        }}
+        svg.speaking .wave-1 {{ animation: propagate-wave .8s ease-out infinite; }}
+        svg.speaking .wave-2 {{ animation: propagate-wave-2 .8s ease-out infinite .3s; }}
+        svg.speaking .wave-3 {{ animation: propagate-wave-3 .8s ease-out infinite .6s; }}
+
+        .radar-status {{
+          text-align:center; margin-top:8px; color:#44f1ff; font-size:13px;
+          letter-spacing:1px; text-transform:uppercase;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <h3 class="title">Radar Vocal</h3>
+        <div class="radar-container">
+          <svg class="{svg_cls}" viewBox="0 0 300 300" preserveAspectRatio="xMidYMid meet">
+            <defs>
+              <filter id="glow">
+                <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+                <feMerge>
+                  <feMergeNode in="coloredBlur"/>
+                  <feMergeNode in="SourceGraphic"/>
+                </feMerge>
+              </filter>
+            </defs>
+
+            <circle cx="150" cy="150" r="140" fill="none" stroke="#00d4e8" stroke-width="1" opacity="0.3"/>
+            <circle cx="150" cy="150" r="105" fill="none" stroke="#00d4e8" stroke-width="1" opacity="0.25"/>
+            <circle cx="150" cy="150" r="70"  fill="none" stroke="#00d4e8" stroke-width="1.5" opacity="0.35"/>
+            <circle cx="150" cy="150" r="35"  fill="none" stroke="#00d4e8" stroke-width="1" opacity="0.3"/>
+
+            <line x1="10"  y1="150" x2="290" y2="150" stroke="#00d4e8" stroke-width="1" opacity="0.2"/>
+            <line x1="150" y1="10"  x2="150" y2="290" stroke="#00d4e8" stroke-width="1" opacity="0.2"/>
+
+            <g id="waves">
+              <circle class="wave wave-1" cx="150" cy="150" r="5" filter="url(#glow)"/>
+              <circle class="wave wave-2" cx="150" cy="150" r="5" filter="url(#glow)"/>
+              <circle class="wave wave-3" cx="150" cy="150" r="5" filter="url(#glow)"/>
+            </g>
+
+            <circle class="radar-center-circle {center_cls}" cx="150" cy="150" r="28"/>
+
+            <circle class="radar-dot" cx="150" cy="20"  r="5"/>
+            <circle class="radar-dot" cx="195" cy="37"  r="5"/>
+            <circle class="radar-dot" cx="250" cy="80"  r="5"/>
+            <circle class="radar-dot" cx="275" cy="135" r="5"/>
+            <circle class="radar-dot" cx="280" cy="150" r="5"/>
+            <circle class="radar-dot" cx="275" cy="220" r="5"/>
+            <circle class="radar-dot" cx="220" cy="270" r="5"/>
+            <circle class="radar-dot" cx="150" cy="280" r="5"/>
+            <circle class="radar-dot" cx="105" cy="263" r="5"/>
+            <circle class="radar-dot" cx="25"  cy="220" r="5"/>
+            <circle class="radar-dot" cx="20"  cy="150" r="5"/>
+            <circle class="radar-dot" cx="105" cy="37"  r="5"/>
+          </svg>
+        </div>
+        <div class="radar-status">{label}</div>
+      </div>
+    </body>
+    </html>
+    """
+    components.html(html_snippet, height=480, scrolling=False)
+
 # -------------- Tabs --------------
 tab_interface, tab_settings = st.tabs(["🎛️ Interface", "⚙️ Settings"])
 
+# -------------------- Interface (Chat) --------------------
 with tab_interface:
     now_ts = time.time()
     last_ts = st.session_state.get("last_assistant_ts", 0.0)
@@ -748,22 +943,13 @@ with tab_interface:
     st.session_state.assistant_speaking = speaking
 
     mode = st.session_state.get("interaction_mode", "chat")
-    radar_class = "visualizer speaking" if speaking else "visualizer"
-    radar_label = "Mode vocal" if mode == "vocal" else "Mode chat"
 
     c1, c2 = st.columns([5,7])
     with c1:
-        st.markdown('<div class="card"><h3>Radar Vocal</h3>', unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="{radar_class}"><div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div>'
-            '<div class="equalizer"><div class="bar b1"></div><div class="bar b2"></div><div class="bar b3"></div><div class="bar b4"></div><div class="bar b5"></div></div>'
-            f'<div class="radar-label">{radar_label}</div></div>',
-            unsafe_allow_html=True,
-        )
-        # st.markdown('<p class="muted" style="margin-top:8px;">Affichage compact. (Le backend micro/FFT est côté jarvis.py)</p></div>', unsafe_allow_html=True)
+        # Radar dans un composant HTML isolé (SVG autorisé)
+        render_radar(speaking=speaking, mode=mode)
 
     with c2:
-        # --- Chat: rendu des messages
         msgs = st.session_state.setdefault("messages", [])
 
         def _render_messages(messages: List[Dict[str, str]]) -> str:
@@ -797,7 +983,7 @@ with tab_interface:
             unsafe_allow_html=True
         )
 
-        # --- Commandes (toggle + formulaire d'envoi)
+        # --- Commandes (toggles rapides + formulaire d'envoi)
         outer_cols = st.columns([3, 12])
         with outer_cols[0]:
             st.markdown('<div class="chat-toggle">', unsafe_allow_html=True)
@@ -808,17 +994,42 @@ with tab_interface:
                 help="Active le mode vocal pour répondre par la voix",
                 on_change=_sync_mode_from_toggle,
             )
+            # --- Websearch: raccourci global (contrôle le proxy MCP)
+            st.divider()
+            st.write("🔎 **Websearch (MCP)**")
+            CFG["mcp"]["proxy"]["enabled"] = st.toggle(
+                "Activer le proxy de recherche",
+                value=bool(CFG["mcp"]["proxy"].get("enabled", False)),
+                help="Active /web, /ddg et les outils MCP via le proxy."
+            )
+            CFG["mcp"]["proxy"]["auto_web"] = st.toggle(
+                "Auto-web (pré-recherche DDG)",
+                value=bool(CFG["mcp"]["proxy"].get("auto_web", False))
+            )
+            # clé unique pour éviter collision
+            CFG["mcp"]["proxy"]["auto_web_topk"] = st.number_input(
+                "Top-K DDG",
+                min_value=1, max_value=20,
+                value=int(CFG["mcp"]["proxy"].get("auto_web_topk", 5)), step=1,
+                key="topk_ddg_interface"
+            )
+            st.divider()
+            st.write("🔄 **Rafraîchissement**")
+            st.session_state.auto_refresh_chat = st.toggle(
+                "Auto-refresh pendant la parole",
+                value=bool(st.session_state.get("auto_refresh_chat", False)),
+                help="Évite que les boutons deviennent difficilement cliquables."
+            )
             st.markdown('</div>', unsafe_allow_html=True)
 
         mode = st.session_state.interaction_mode
         placeholder_text = (
             "MODE VOCAL ACTIVÉ - Utilise ton micro"
             if mode == "vocal"
-            else "MODE CHAT ACTIVÉ - Commence la conversation"
+            else "MODE CHAT ACTIVÉ - Commence la conversation (astuce: /web ta requête)"
         )
 
         with outer_cols[1]:
-            # Formulaire : clear_on_submit évite toute écriture manuelle dans session_state du widget
             with st.form("chat_form", clear_on_submit=True, border=False):
                 inner_cols = st.columns([8, 3])
                 with inner_cols[0]:
@@ -840,10 +1051,77 @@ with tab_interface:
             if submitted and mode == "chat":
                 clean_text = (user_text or "").strip()
                 if clean_text:
-                    msgs.append({"role": "user", "content": clean_text})
-                    # TODO: brancher Ollama ici
-                    reply = ollama_reply(CFG, msgs) or "Réponse vide d'Ollama (vérifie le modèle)."
-                    msgs.append({"role": "assistant", "content": reply})
+                    proxy = CFG["mcp"]["proxy"]
+                    used_proxy = False
+
+                    # --- Shortcuts : /web, /ddg, /fetch, !tool
+                    if proxy.get("enabled") and proxy.get("chat_shortcuts", True):
+                        m_ddg = re.match(r"^/(?:web|ddg)\s+(.+)$", clean_text, flags=re.IGNORECASE)
+                        m_fetch = re.match(r"^/fetch\s+(\S+)$", clean_text, flags=re.IGNORECASE)
+                        m_tool = re.match(r"^!tool\s+([A-Za-z0-9_.:\-]+)\s*(.*)$", clean_text)
+
+                        if m_ddg:
+                            query = m_ddg.group(1).strip()
+                            msgs.append({"role": "user", "content": clean_text})
+                            out = ddg_search(query, topk=int(proxy.get("auto_web_topk", 5)))
+                            ctx = f"[WEB/DDG] Résultats pour: {query}\n{out}\n\n"
+                            msgs.append({"role": "assistant", "content": ctx})
+                            msgs.append({"role": "user", "content": "Sur la base du contexte web ci-dessus, réponds de façon concise."})
+                            reply = ollama_reply(CFG, msgs) or "(réponse vide)"
+                            msgs.append({"role": "assistant", "content": reply})
+                            used_proxy = True
+
+                        elif m_fetch:
+                            url = m_fetch.group(1).strip()
+                            msgs.append({"role": "user", "content": clean_text})
+                            out = ddg_fetch(url)
+                            msgs.append({"role": "assistant", "content": out})
+                            used_proxy = True
+
+                        elif m_tool:
+                            tool_name = m_tool.group(1)
+                            arg_str = (m_tool.group(2) or "").strip()
+                            try:
+                                if arg_str.startswith("{"):
+                                    args = json.loads(arg_str)
+                                else:
+                                    args = {}
+                                    for kv in shlex.split(arg_str):
+                                        if "=" in kv:
+                                            k, v = kv.split("=", 1)
+                                            args[k] = v
+                            except Exception as e:
+                                args = {}
+                                msgs.append({"role": "assistant", "content": f"[MCP] Args invalides: {e}"})
+                            msgs.append({"role": "user", "content": clean_text})
+                            out = mcp_call_tool_via_stdio(
+                                proxy.get("command",""),
+                                proxy.get("args") or [],
+                                proxy.get("env") or {},
+                                tool_name,
+                                args,
+                                timeout_s=int(proxy.get("tool_timeout_s", 60)),
+                            )
+                            msgs.append({"role": "assistant", "content": out})
+                            used_proxy = True
+
+                    # --- Auto-web (facultatif) : prepend contexte DDG avant Ollama
+                    if proxy.get("enabled") and proxy.get("auto_web", False) and not used_proxy:
+                        msgs.append({"role": "user", "content": clean_text})
+                        search_out = ddg_search(clean_text, topk=int(proxy.get("auto_web_topk", 5)))
+                        ctx = f"[WEB/DDG:auto] Résultats bruts:\n{search_out}\n\n"
+                        msgs.append({"role": "assistant", "content": ctx})
+                        msgs.append({"role": "user", "content": "Utilise le contexte DDG ci-dessus pour répondre brièvement."})
+                        reply = ollama_reply(CFG, msgs) or "(réponse vide)"
+                        msgs.append({"role": "assistant", "content": reply})
+                        used_proxy = True
+
+                    # --- Sinon: LLM pur
+                    if not used_proxy:
+                        msgs.append({"role": "user", "content": clean_text})
+                        reply = ollama_reply(CFG, msgs) or "Réponse vide d'Ollama (vérifie le modèle)."
+                        msgs.append({"role": "assistant", "content": reply})
+
                     st.session_state["messages"] = msgs[-200:]
                     st.session_state.last_assistant_ts = time.time()
                     st.session_state.assistant_speaking = True
@@ -854,6 +1132,7 @@ with tab_interface:
 
         st.caption(f"Messages en mémoire: {len(st.session_state.get('messages', []))}")
 
+# -------------------- Settings --------------------
 with tab_settings:
     t0, t1, t2, t3, t4, t5 = st.tabs(["Jarvis", "Whisper", "Piper", "Ollama", "MCP", "💾 Sauvegarde"])
 
@@ -967,8 +1246,10 @@ with tab_settings:
 
     with t2:
         st.write("**Sélection de la voix Piper**")
+        # simplification + suppression du bug de tuple
         CFG["piper"]["base_dir"] = st.text_input(
-            "Dossier des voix (local serveur)", value=CFG["piper"].get("base_dir", "")
+            "Dossier des voix (local serveur)",
+            value=str(CFG["piper"].get("base_dir", "")),
         ).strip()
         up1, up2 = st.columns(2)
         with up1:
@@ -995,27 +1276,14 @@ with tab_settings:
         CFG["piper"]["voice"] = sel
         colP1, colP2 = st.columns(2)
         with colP1:
-            CFG["piper"]["speaker_id"] = st.number_input(
-                "Speaker ID", min_value=0, max_value=999, value=int(CFG["piper"].get("speaker_id", 0)), step=1
-            )
-            CFG["piper"]["use_cuda"] = st.toggle(
-                "Activer CUDA (--cuda)", value=bool(CFG["piper"].get("use_cuda", False))
-            )
+            CFG["piper"]["speaker_id"] = st.number_input("Speaker ID", min_value=0, max_value=999, value=int(CFG["piper"].get("speaker_id", 0)), step=1)
+            CFG["piper"]["use_cuda"] = st.toggle("Activer CUDA (--cuda)", value=bool(CFG["piper"].get("use_cuda", False)))
         with colP2:
-            CFG["piper"]["speed"] = st.number_input(
-                "Vitesse (length scale)", min_value=0.5, max_value=2.0,
-                value=float(CFG["piper"].get("speed", 0.9)), step=0.05
-            )
+            CFG["piper"]["speed"] = st.number_input("Vitesse (length scale)", min_value=0.5, max_value=2.0, value=float(CFG["piper"].get("speed", 0.9)), step=0.05)
 
-        CFG["piper"]["noise"] = st.slider(
-            "Noise scale", 0.0, 2.0, float(CFG["piper"].get("noise", 0.667)), 0.01
-        )
-        CFG["piper"]["noise_w"] = st.slider(
-            "Noise width", 0.0, 2.0, float(CFG["piper"].get("noise_w", 0.8)), 0.01
-        )
-        CFG["piper"]["sentence_silence"] = st.slider(
-            "Silence inter-phrases (s)", 0.0, 1.0, float(CFG["piper"].get("sentence_silence", 0.10)), 0.01
-        )
+        CFG["piper"]["noise"] = st.slider("Noise scale", 0.0, 2.0, float(CFG["piper"].get("noise", 0.667)), 0.01)
+        CFG["piper"]["noise_w"] = st.slider("Noise width", 0.0, 2.0, float(CFG["piper"].get("noise_w", 0.8)), 0.01)
+        CFG["piper"]["sentence_silence"] = st.slider("Silence inter-phrases (s)", 0.0, 1.0, float(CFG["piper"].get("sentence_silence", 0.10)), 0.01)
 
     with t3:
         st.write("**Ollama**")
@@ -1066,7 +1334,7 @@ with tab_settings:
                     st.success("Chargé") if ok else st.error("Échec warm-up")
 
     with t4:
-        st.write("**Serveurs MCP**")
+        st.write("**Serveurs MCP (legacy)**")
         servers = CFG.setdefault("mcp", {}).setdefault("servers", [])
         add_col, _ = st.columns([1, 4])
         with add_col:
@@ -1084,16 +1352,9 @@ with tab_settings:
                 )
                 st.rerun()
 
-        try:
-            import importlib.util as _ilu
-            mcp_installed = _ilu.find_spec("mcp") is not None
-        except Exception:
-            mcp_installed = False
+        mcp_installed = _mcp_import_ok()
         if not mcp_installed:
-            st.info(
-                "Bibliothèque Python `mcp` introuvable. Installe-la (ex: `pip install modelcontextprotocol`)"
-                " pour permettre la découverte des outils."
-            )
+            st.info("Installe le SDK MCP: `pip install mcp` (ou `pip install modelcontextprotocol`).")
 
         remove_index: Optional[int] = None
         if not servers:
@@ -1109,19 +1370,12 @@ with tab_settings:
                 server["auto_start"] = st.toggle(
                     "Démarrage automatique", value=bool(server.get("auto_start", True)), key=f"mcp_autostart_{server_id}"
                 )
-
-                server["name"] = st.text_input(
-                    "Nom dans l'interface", value=server.get("name", "Serveur MCP"), key=f"mcp_name_{server_id}"
-                )
+                server["name"] = st.text_input("Nom dans l'interface", value=server.get("name", "Serveur MCP"), key=f"mcp_name_{server_id}")
                 cols = st.columns([2, 3])
                 with cols[0]:
-                    server["command"] = st.text_input(
-                        "Commande", value=server.get("command", ""), key=f"mcp_command_{server_id}"
-                    )
+                    server["command"] = st.text_input("Commande", value=server.get("command", ""), key=f"mcp_command_{server_id}")
                 with cols[1]:
-                    args_text = st.text_input(
-                        "Arguments", value=" ".join(server.get("args", [])), key=f"mcp_args_{server_id}"
-                    )
+                    args_text = st.text_input("Arguments", value=" ".join(server.get("args", [])), key=f"mcp_args_{server_id}")
                     if args_text.strip():
                         try:
                             server["args"] = shlex.split(args_text)
@@ -1129,31 +1383,20 @@ with tab_settings:
                             server["args"] = args_text.split()
                     else:
                         server["args"] = []
-
                 env_lines = []
                 env_dict = server.get("env", {}) or {}
                 for k, v in env_dict.items():
                     env_lines.append(f"{k}={v}")
-                env_text = st.text_area(
-                    "Variables d'environnement (clé=valeur, une par ligne)",
-                    value="\n".join(env_lines),
-                    key=f"mcp_env_{server_id}",
-                    height=100,
-                )
+                env_text = st.text_area("Variables d'environnement (clé=valeur, une par ligne)", value="\n".join(env_lines), key=f"mcp_env_{server_id}", height=100)
                 env: Dict[str, str] = {}
                 for line in env_text.splitlines():
-                    if not line.strip():
-                        continue
-                    if "=" not in line:
+                    if not line.strip() or "=" not in line:
                         continue
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip()
                 server["env"] = env
 
-                cmd_preview = " ".join(
-                    [server.get("command", "").strip()]
-                    + [a for a in server.get("args", []) if a]
-                ).strip()
+                cmd_preview = " ".join([server.get("command", "").strip()] + [a for a in server.get("args", []) if a]).strip()
                 st.caption(f"Commande effective : `{cmd_preview}`")
 
                 sid = server["id"]
@@ -1169,7 +1412,7 @@ with tab_settings:
                     running = _mcp_running(sid)
                     st.caption(("🟢 en cours" if running else "🔴 arrêté") + f" · log: {os.path.join('~/.jarvis/mcp-logs', sid + '.log')}")
 
-                if st.button("🔍 Lister tools", key=f"mcp_probe_{sid}"):
+                if st.button("🔍 Lister tools (spawn éphémère)", key=f"mcp_probe_{sid}"):
                     tools = _probe_mcp_tools(server)
                     if tools is not None:
                         st.success(", ".join(tools) or "(aucun)")
@@ -1184,6 +1427,85 @@ with tab_settings:
                 pass
             st.rerun()
 
+        st.markdown("---")
+        # ---------- Proxy (Client MCP stdio) ----------
+        st.write("**Proxy MCP (adamwattis) — Client stdio éphémère**")
+        proxy = CFG["mcp"]["proxy"]
+        cols = st.columns([2,3])
+        with cols[0]:
+            proxy["enabled"] = st.toggle("Activer le client proxy", value=bool(proxy.get("enabled", False)))
+        with cols[1]:
+            proxy["command"] = st.text_input("Commande proxy (build/index.js ABSOLU)", value=proxy.get("command",""))
+        proxy_args_text = st.text_input("Arguments proxy", value=" ".join(proxy.get("args",[]) or []))
+        if proxy_args_text.strip():
+            try:
+                proxy["args"] = shlex.split(proxy_args_text)
+            except Exception:
+                proxy["args"] = proxy_args_text.split()
+        else:
+            proxy["args"] = []
+        env_lines = [f"{k}={v}" for k, v in (proxy.get("env") or {}).items()]
+        env_text = st.text_area("ENV (inclure MCP_CONFIG_PATH=/ABSOLU/adamwattis_mcp-proxy-server/config.json)", value="\n".join(env_lines), height=80)
+        new_env: Dict[str,str] = {}
+        for line in env_text.splitlines():
+            if not line.strip() or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            new_env[k.strip()] = v.strip()
+        proxy["env"] = new_env
+        proxy["tool_timeout_s"] = st.number_input("Timeout tool (s)", min_value=5, max_value=600, value=int(proxy.get("tool_timeout_s",60)), step=5)
+
+        st.markdown("—")
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            proxy["chat_shortcuts"] = st.toggle("Raccourcis chat (/web, /fetch)", value=bool(proxy.get("chat_shortcuts", True)))
+        with cc2:
+            proxy["auto_web"] = st.toggle("Auto-web (DDG avant LLM)", value=bool(proxy.get("auto_web", False)))
+        with cc3:
+            proxy["auto_web_topk"] = st.number_input(
+                "Top-K DDG",
+                min_value=1, max_value=20,
+                value=int(proxy.get("auto_web_topk",5)), step=1,
+                key="topk_ddg_settings"
+            )
+
+        colp1, colp2 = st.columns(2)
+        with colp1:
+            if st.button("🔍 Lister tools (via proxy)"):
+                if not _mcp_import_ok():
+                    st.error("Installe le SDK MCP: `pip install mcp`.")
+                else:
+                    try:
+                        tools = mcp_list_tools_via_stdio(proxy.get("command",""), proxy.get("args") or [], proxy.get("env") or {})
+                        st.success(", ".join(tools) or "(aucun)")
+                    except Exception as e:
+                        st.error(f"Echec list_tools: {e}")
+        with colp2:
+            with st.popover("▶️ Appeler un tool (proxy)"):
+                tname = st.text_input("Nom du tool", placeholder="ex: search")
+                targ  = st.text_area("Arguments (JSON)", placeholder='{"query":"hello"}', height=120)
+                if st.button("Exécuter"):
+                    try:
+                        args = json.loads(targ) if targ.strip() else {}
+                    except Exception as e:
+                        st.error(f"JSON invalide: {e}")
+                        args = None
+                    if args is not None:
+                        try:
+                            out = mcp_call_tool_via_stdio(
+                                proxy.get("command",""),
+                                proxy.get("args") or [],
+                                proxy.get("env") or {},
+                                tname.strip(),
+                                args,
+                                timeout_s=int(proxy.get("tool_timeout_s",60)),
+                            )
+                            st.code(out or "(vide)", language="markdown")
+                        except Exception as e:
+                            st.error(f"Echec call_tool: {e}")
+
+        st.caption("Raccourcis chat:  `/web requête`  ·  `/ddg requête`  ·  `/fetch URL`  ·  `!tool <nom> {json}`")
+
     with t5:
         csa, csb = st.columns(2)
         with csa:
@@ -1194,9 +1516,12 @@ with tab_settings:
                 st.cache_data.clear()
                 st.rerun()
 
-#st.caption(f"Config: {CONFIG_PATH}")
-
-# --- Auto-refresh quand Jarvis tourne en mode vocal ---
-if st.session_state.get("jarvis_running") and st.session_state.get("interaction_mode") == "vocal":
+# --- Auto-refresh quand Jarvis tourne en mode vocal (désactivable) ---
+if (
+    st.session_state.get("jarvis_running")
+    and st.session_state.get("interaction_mode") == "vocal"
+    and st.session_state.get("auto_refresh_chat", False)
+    and (time.time() - st.session_state.get("last_assistant_ts", 0.0)) < 10
+):
     time.sleep(0.5)
     st.rerun()
