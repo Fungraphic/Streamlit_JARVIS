@@ -125,6 +125,15 @@ def log(msg: str):
     try: q_log.put_nowait(msg)
     except Exception: pass
 
+
+def _reserve_wav_path(prefix: str) -> str:
+    """Return a unique temporary WAV path created atomically."""
+    tmp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".wav", delete=False)
+    try:
+        return tmp.name
+    finally:
+        tmp.close()
+
 # ===================== MCP (Model Context Protocol) =====================
 
 def _resolve_mcp_classes() -> Tuple[Optional[type], Optional[type]]:
@@ -516,7 +525,7 @@ def is_silence(audio_i16: np.ndarray, abs_thr: int = 120, rms_thr: float = 60.0)
 def write_wav_tmp(audio_i16: np.ndarray, boost: float = 2.0) -> str:
     x = (audio_i16.astype(np.float32) / 32768.0) * float(boost)
     x = np.clip(x, -1.0, 1.0)
-    path = tempfile.mktemp(prefix="jarvis_", suffix=".wav")
+    path = _reserve_wav_path("jarvis_")
     sf.write(path, x, int(sd.default.samplerate))
     return path
 
@@ -719,7 +728,7 @@ class PiperTTS:
         except Exception as e:
             log(f"[TTS] Piper streaming erreur: {e}")
             # Secours : génération WAV puis lecture blocante
-            tmp = tempfile.mktemp(prefix="piper_", suffix=".wav")
+            tmp = _reserve_wav_path("piper_")
             try:
                 fallback_args = [
                     self.exe, "-m", self.voice, "-f", tmp,

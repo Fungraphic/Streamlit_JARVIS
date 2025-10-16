@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex, asyncio
+import os, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex, asyncio, copy
 from typing import List, Dict, Any, Optional, Tuple, Union
 import streamlit as st
 import requests
@@ -40,9 +40,9 @@ DEFAULT_CFG: Dict[str, Any] = {
     "mcp": {
         "servers": [],
         "proxy": {
-            "enabled": True,
-            "command": "node",
-            "args": ["/ABSOLU/adamwattis_mcp-proxy-server/build/index.js"],
+            "enabled": False,
+            "command": "",
+            "args": [],
             "env": {},
             "tool_timeout_s": 60,
             "chat_shortcuts": True,
@@ -134,17 +134,17 @@ def load_cfg() -> Dict[str, Any]:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                cfg = DEFAULT_CFG.copy()
+                cfg = copy.deepcopy(DEFAULT_CFG)
                 for k, v in (data or {}).items():
                     if isinstance(v, dict):
-                        cfg[k] = {**cfg.get(k, {}), **v}
+                        cfg[k] = {**cfg.get(k, {}), **copy.deepcopy(v)}
                     else:
                         cfg[k] = v
                 _normalize_mcp_servers(cfg)
                 return cfg
     except Exception as e:
         st.warning(f"Lecture config échouée: {e}")
-    cfg = DEFAULT_CFG.copy()
+    cfg = copy.deepcopy(DEFAULT_CFG)
     _normalize_mcp_servers(cfg)
     return cfg
 
