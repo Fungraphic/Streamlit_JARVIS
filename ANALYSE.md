@@ -1,23 +1,24 @@
-# Analyse du dépôt Streamlite_JARVIS
+# Analyse du dépôt Streamlit_JARVIS
 
-## Problèmes identifiés
+## Problèmes critiques à corriger
 
-1. **Synchronisation totale UI ⇄ Jarvis**
-   Toutes les préférences (Whisper, Piper, TTS, wake-word, Ollama, sortie audio) sont maintenant exportées en variables d'environnement avant le chargement de `jarvis.py`. Le backend consomme exactement les valeurs choisies dans l'interface, y compris la voix Piper et les paramètres de détection du mot-clé. 【F:app.py†L34-L126】【F:app.py†L206-L274】【F:jarvis.py†L36-L136】【F:jarvis.py†L512-L579】
+1. **Configuration par défaut mutée en mémoire**  
+   `load_cfg()` part d'une copie superficielle de `DEFAULT_CFG`. Les sous-dictionnaires (`mcp`, `piper`, etc.) restent donc partagés avec l'original, puis `_normalize_mcp_servers()` ré-écrit ces structures sur place. Résultat : la première lecture de config modifie aussi `DEFAULT_CFG`, ce qui change les valeurs par défaut pour la session suivante ou pour tout utilisateur qui n'a pas encore de fichier `ui_config.json`. 【F:app.py†L69-L149】
 
-2. **Dépendances alignées avec le code**
-   Le fichier `requirements.txt` inclut désormais `numpy`, `ollama`, `rapidfuzz` et bascule sur `onnxruntime` CPU par défaut. Les installateurs disposent d'une note pour ajouter la version GPU si nécessaire. Cela évite les erreurs d'import et les installations inutiles sur des machines sans CUDA. 【F:requirements.txt†L1-L11】【F:jarvis.py†L17-L45】
+2. **Proxy MCP inexploitable par défaut**  
+   Le proxy activé par défaut pointe vers `node /ABSOLU/adamwattis_mcp-proxy-server/build/index.js`. Ce chemin n'existe pas dans le dépôt ni dans une installation standard, provoquant un échec systématique dès que l'utilisateur tente d'utiliser les raccourcis MCP. 【F:app.py†L40-L52】
 
-3. **Paramètres Ollama unifiés**
-   L'UI et Jarvis partagent le même modèle, la température, la taille de contexte et le mode streaming via `OLLAMA_*`. Les ajustements effectués depuis Streamlit s'appliquent immédiatement au backend, qui les loggue et utilise les options lors des appels `chat`. 【F:app.py†L71-L122】【F:jarvis.py†L94-L134】【F:jarvis.py†L420-L506】
+3. **Dépendances Ollama/Piper impossibles à installer sur CPU**  
+   Le fichier `requirements.txt` exige à la fois `onnxruntime` (CPU) et `onnxruntime-gpu`. Ces paquets fournissent les mêmes modules et entrent en conflit : l'installation échoue ou tente de charger CUDA (`libcuda.so`) sur des machines qui n'en disposent pas. Il faut choisir une variante selon la cible matérielle, pas les deux. 【F:requirements.txt†L1-L15】
 
-## Points de vigilance restants
+## Risques de sécurité
 
-- **Démarrage Ollama externe** : l'interface peut lancer `ollama serve`, mais l'utilisateur doit toujours vérifier la disponibilité réseau et l'espace disque pour les modèles lourds. 【F:app.py†L135-L215】
-- **Voix Piper à déployer manuellement** : l'UI permet l'upload, toutefois `jarvis.py` exige le binaire `piper` dans le PATH et les paires `.onnx`/`.onnx.json` valides côté serveur. 【F:app.py†L305-L351】【F:jarvis.py†L270-L374】
+- **Création de fichiers temporaires non sécurisée**  
+  `write_wav_tmp()` et le repli Piper utilisent `tempfile.mktemp()`, une fonction déconseillée car sujette aux conditions de course (un processus tiers peut créer le fichier avant l'écriture). Il est préférable d'utiliser `NamedTemporaryFile(delete=False)` ou `mkstemp()` pour obtenir un chemin réservé de manière atomique. 【F:jarvis.py†L516-L522】【F:jarvis.py†L701-L744】
 
-## Recommandations générales
+## Recommandations
 
-- Harmoniser la gestion de configuration (idéalement un fichier partagé ou des variables d'environnement communes) afin que l'UI et le backend utilisent les mêmes valeurs par défaut.
-- Ajouter un script de vérification des dépendances ou un guide d'installation précisant les modules optionnels versus obligatoires.
-- Prévoir un mécanisme de validation dans l'UI pour alerter l'utilisateur lorsque Jarvis tourne avec une configuration incompatible (voix Piper absente, Ollama indisponible, etc.).
+- Cloner profondément (`copy.deepcopy`) `DEFAULT_CFG` avant toute mutation, ou reconstruire une nouvelle structure à partir des valeurs lues pour éviter de polluer les défauts.  
+- Fournir une valeur proxy MCP neutre (désactivée ou pointant vers un script inclus) et proposer des champs à remplir dans l'UI.  
+- Scinder les dépendances Piper en deux extras (`onnxruntime` **ou** `onnxruntime-gpu`) ou documenter clairement la marche à suivre selon le matériel.  
+- Remplacer `tempfile.mktemp()` par `NamedTemporaryFile(delete=False)` / `mkstemp()` et gérer la fermeture/suppression en conséquence.
