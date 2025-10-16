@@ -64,6 +64,9 @@ DEFAULT_CFG: Dict[str, Any] = {
     },
 }
 
+# --- dossier logs MCP
+MCP_LOG_DIR = os.path.join(CONFIG_DIR, "mcp-logs")
+os.makedirs(MCP_LOG_DIR, exist_ok=True)
 
 def _normalize_mcp_servers(cfg: Dict[str, Any]) -> None:
     """Ensure MCP server configs are dict-based and fill defaults."""
@@ -227,11 +230,57 @@ def is_ollama_up(host: str) -> bool:
     except Exception:
         return False
 
+def _build_ollama_chat_messages(messages):
+    mapped = []
+    for m in messages[-20:]:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if not content:
+            continue
+        if role not in ("user", "assistant", "system"):
+            role = "assistant" if role != "user" else "user"
+        mapped.append({"role": role, "content": content})
+    if mapped and mapped[0]["role"] == "assistant":
+        mapped = [{"role": "system", "content": "You are Jarvis."}] + mapped
+    return mapped
+
+def ollama_reply(cfg, messages) -> str:
+    host = cfg["ollama"]["host"]
+    model = cfg["ollama"]["model"]
+    options = {
+        "temperature": float(cfg["ollama"].get("temperature", 0.7)),
+        "num_ctx": int(cfg["ollama"].get("num_ctx", 4096)),
+    }
+    if not is_ollama_up(host):
+        return "Ollama est indisponible (API /api/tags KO)."
+
+    # Essai principal : /api/chat
+    try:
+        url = host.rstrip("/") + "/api/chat"
+        payload = {
+            "model": model,
+            "messages": _build_ollama_chat_messages(messages),
+            "stream": False,
+            "options": options,
+        }
+        r = requests.post(url, json=payload, timeout=120)
+        r.raise_for_status()
+        data = r.json() or {}
+        return (data.get("message") or {}).get("content") or ""
+    except Exception:
+        # Repli : /api/generate avec le dernier message user
+        try:
+            last_user = next((m["content"] for m in reversed(messages) if m.get("role")=="user"), "")
+            url = host.rstrip("/") + "/api/generate"
+            payload = {"model": model, "prompt": last_user, "stream": False, "options": options}
+            r = requests.post(url, json=payload, timeout=120)
+            r.raise_for_status()
+            data = r.json() or {}
+            return data.get("response") or data.get("text") or ""
+        except Exception as e2:
+            return f"Erreur Ollama: {e2}"
+
 def start_ollama_daemon(log_path: Optional[str] = None) -> bool:
-    """
-    Try to start 'ollama serve' detached. Returns True if Popen succeeded.
-    The server may need a few seconds to become ready.
-    """
     try:
         kwargs = {}
         if log_path:
@@ -264,7 +313,6 @@ def pull_model(model: str) -> bool:
         return False
 
 def warmup_model(host: str, model: str) -> bool:
-    """Trigger a tiny /api/generate to load weights into memory."""
     try:
         url = host.rstrip("/") + "/api/generate"
         payload = {"model": model, "prompt": "ok", "stream": False}
@@ -286,6 +334,83 @@ def save_uploaded(file, dest_dir: str) -> Optional[str]:
     except Exception as e:
         st.error(f"Enregistrement échoué: {e}")
         return None
+
+# -------------- gestion des serveurs MCP (spawn/stop/probe) --------------
+if "mcp_procs" not in st.session_state:
+    st.session_state.mcp_procs = {}   # id -> Popen
+if "mcp_autostart_done" not in st.session_state:
+    st.session_state.mcp_autostart_done = False
+
+def _server_key(s: Dict[str, Any]) -> str:
+    return s.get("id") or s.get("name") or uuid.uuid4().hex[:8]
+
+def _server_cmd(s: Dict[str, Any]) -> List[str]:
+    cmd = (s.get("command") or "").strip()
+    args = s.get("args") or []
+    return [cmd] + [a for a in args if a]
+
+def _spawn_mcp_server(s: Dict[str, Any]) -> bool:
+    sid = _server_key(s)
+    p = st.session_state.mcp_procs.get(sid)
+    if p and p.poll() is None:
+        return True
+    cmd = _server_cmd(s)
+    if not cmd or not cmd[0]:
+        st.error(f"[MCP] Commande vide pour {sid}")
+        return False
+    env = os.environ.copy()
+    for k, v in (s.get("env") or {}).items():
+        if k and v is not None:
+            env[str(k)] = str(v)
+    log_path = os.path.join(MCP_LOG_DIR, f"{sid}.log")
+    try:
+        out = open(log_path, "ab", buffering=0)
+        p = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        st.session_state.mcp_procs[sid] = p
+        return True
+    except Exception as e:
+        st.error(f"[MCP] Échec lancement {sid}: {e}")
+        return False
+
+def _stop_mcp_server(sid: str):
+    p = st.session_state.mcp_procs.get(sid)
+    if not p:
+        return
+    try:
+        p.terminate()
+        try:
+            p.wait(timeout=2)
+        except Exception:
+            p.kill()
+    finally:
+        st.session_state.mcp_procs.pop(sid, None)
+
+def _mcp_running(sid: str) -> bool:
+    p = st.session_state.mcp_procs.get(sid)
+    return bool(p and p.poll() is None)
+
+def _probe_mcp_tools(s: Dict[str, Any]) -> Optional[List[str]]:
+    try:
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+    except Exception:
+        st.warning("SDK MCP Python introuvable (`pip install modelcontextprotocol`).")
+        return None
+    params = StdioServerParameters(
+        command=s.get("command"),
+        args=s.get("args") or [],
+        env=s.get("env") or {},
+    )
+
+    async def _go():
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as sess:
+                await sess.initialize()
+                lst = await sess.list_tools()
+                return [t.name for t in (lst.tools or [])]
+
+    import asyncio
+    return asyncio.run(_go())
 
 # -------------- Jarvis runtime (local) --------------
 if "jarvis_mod" not in st.session_state:
@@ -310,6 +435,7 @@ if "mode_toggle" not in st.session_state:
 def _set_interaction_mode(mode: str):
     mode = "vocal" if mode == "vocal" else "chat"
     if mode != st.session_state.interaction_mode and mode == "vocal":
+        # nettoyer la saisie AVANT instanciation du widget (à la prochaine relance)
         st.session_state["chat_input"] = ""
     st.session_state.interaction_mode = mode
     st.session_state.previous_interaction_mode = mode
@@ -326,7 +452,7 @@ def _load_jarvis_module(path: str):
     if not spec or not spec.loader:
         raise RuntimeError("Impossible de charger jarvis.py")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # charge ton jarvis.py
+    spec.loader.exec_module(mod)
     return mod
 
 def start_jarvis(cfg: Dict[str, Any]):
@@ -349,7 +475,7 @@ def start_jarvis(cfg: Dict[str, Any]):
                 pass
         def _run():
             try:
-                jarvis.main()  # lance la boucle wake+STT+TTS locale
+                jarvis.main()
             except Exception as e:
                 try:
                     jarvis.q_log.put_nowait(f"[UI] Exception: {e}")
@@ -408,20 +534,16 @@ new_logs = drain_jarvis_logs() if st.session_state.jarvis_running else []
 if new_logs:
     _update_speaking_state_from_logs(new_logs)
 
-# ---- NOUVEAU: parsing des logs plus robuste + mise à jour messages
+# ---- parsing des logs + mise à jour messages
 def _ingest_chat_from_logs(logs: List[str]):
     if not logs:
         return
-
     msgs = st.session_state.setdefault("messages", [])
     changed = False
-
     for raw in logs:
         line = (raw or "").strip()
         if not line:
             continue
-
-        # User speech: accepte [STT] ou [VOICE], "Vous" ou "You", espaces après ":".
         m_user = re.match(r'^\[(?:STT|VOICE)\]\s*(?:Vous|You)\s*:\s*(.+)$', line, flags=re.IGNORECASE)
         if m_user:
             content = m_user.group(1).strip()
@@ -429,8 +551,6 @@ def _ingest_chat_from_logs(logs: List[str]):
                 msgs.append({"role": "user", "content": content})
                 changed = True
             continue
-
-        # Assistant speech: "JARVIS:" ou "Assistant:"
         m_ass = re.match(r'^(?:JARVIS|Assistant)\s*:\s*(.+)$', line, flags=re.IGNORECASE)
         if m_ass:
             content = m_ass.group(1).strip()
@@ -438,7 +558,6 @@ def _ingest_chat_from_logs(logs: List[str]):
                 msgs.append({"role": "assistant", "content": content})
                 changed = True
             continue
-
     if changed:
         st.session_state["messages"] = msgs[-200:]
         st.rerun()
@@ -451,6 +570,8 @@ st.markdown("""
 :root{
   --bg: #0b0f14; --panel: #0e141b; --muted: #121923; --border: #1b2633;
   --primary: #44f1ff; --primary-2: #00c2d1; --fg: #e6f1ff; --muted-fg:#7b8ba1; --accent:#101926;
+  --ok: #2ecc71;   /* vert */
+  --bad: #e74c3c;  /* rouge */
 }
 .main .block-container{ padding-top: 0rem; }
 body{
@@ -476,14 +597,40 @@ body::before{
   background: linear-gradient(180deg, var(--panel), var(--muted)); border: 1px solid var(--border);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 12px; color: var(--fg); }
-.dot{ width:8px; height:8px; border-radius:999px; background: var(--primary);
-  box-shadow: 0 0 12px rgba(68,241,255,0.9), 0 0 30px rgba(68,241,255,0.35); animation: pulse 1.6s ease-in-out infinite; }
+.dot{ width:8px; height:8px; border-radius:999px; opacity:.95 }
+.dot.ok{
+  background: var(--ok);
+  box-shadow: 0 0 12px rgba(46,204,113,.9), 0 0 30px rgba(46,204,113,.35);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.dot.bad{
+  background: var(--bad);
+  box-shadow: 0 0 12px rgba(231,76,60,.9), 0 0 30px rgba(231,76,60,.35);
+}
 @keyframes pulse{0%{transform:scale(.9);opacity:.8}50%{transform:scale(1.2);opacity:1}100%{transform:scale(.9);opacity:.8}}
 .card{ background: linear-gradient(180deg, var(--panel), var(--muted)); border: 1px solid var(--border);
   border-radius: 14px; padding: 14px; }
 .card h3{ margin: 0 0 8px 0; color: var(--fg); }
 .muted{ color: var(--muted-fg); }
 
+/* Chat */
+.chat-card{ display:flex; flex-direction:column; }
+.chat-card-body{ display:flex; flex-direction:column; gap:14px; }
+.chat-wrap{ display:flex; flex-direction:column; height:520px; }
+.msgs{ flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; padding-right:6px; min-width:0; }
+.bubble{ max-width: 92%; padding:10px 12px; border-radius: 12px; border: 1px solid var(--border);
+         min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; text-overflow:clip; }
+.user{ align-self:flex-end; background: rgba(68,241,255,0.08); }
+.assistant{ align-self:flex-start; background: rgba(255,255,255,0.04); }
+.chat-toggle{ margin-top:8px; }
+.chat-toggle [data-testid="stToggle"]{ width:100%; background: var(--accent); padding:10px 12px; border-radius: 12px; border:1px solid var(--border); }
+.chat-toggle [data-testid="stToggle"] label{ color: var(--fg); font-weight:600; }
+.chat-toggle [data-testid="stToggle"] [data-testid="stTickBar"]{ background: var(--primary); }
+.chat-input input{ background: var(--accent) !important; color: var(--fg) !important; border:1px solid var(--border); border-radius: 10px; padding:10px 12px; }
+.chat-send button{ background: linear-gradient(180deg, #0b485b, #083947); border:1px solid var(--primary-2); color: white; border-radius: 10px; padding:10px 14px; cursor:pointer; }
+.chat-send button:disabled{ background: linear-gradient(180deg, #1a222d, #121a24); border-color: var(--border); color: var(--muted-fg); cursor:not-allowed; }
+
+/* Visualizer */
 .visualizer{ position:relative; width:min(100%, 360px); aspect-ratio: 1 / 1; margin: 16px auto 0;
   display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:50%;
   background: radial-gradient(320px 320px at 50% 50%, rgba(68,241,255,0.08), transparent 70%);
@@ -531,38 +678,64 @@ body::before{
   padding:8px 12px; border-radius:999px; background:rgba(11,15,20,0.75); border:1px solid rgba(68,241,255,0.35);
   font-size:13px; letter-spacing:1px; text-transform:uppercase; color:var(--primary); }
 .visualizer.speaking .radar-label{ color:#0b0f14; background:rgba(68,241,255,0.85); }
-
-.chat-card{ display:flex; flex-direction:column; }
-.chat-card-body{ display:flex; flex-direction:column; gap:14px; }
-.chat-wrap{ display:flex; flex-direction:column; height:520px; }
-.msgs{ flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; padding-right:6px; }
-.bubble{ max-width: 92%; padding:10px 12px; border-radius: 12px; border: 1px solid var(--border); }
-.user{ align-self:flex-end; background: rgba(68,241,255,0.08); }
-.assistant{ align-self:flex-start; background: rgba(255,255,255,0.04); }
-.chat-toggle{ margin-top:8px; }
-.chat-toggle [data-testid="stToggle"]{ width:100%; background: var(--accent); padding:10px 12px; border-radius: 12px; border:1px solid var(--border); }
-.chat-toggle [data-testid="stToggle"] label{ color: var(--fg); font-weight:600; }
-.chat-toggle [data-testid="stToggle"] [data-testid="stTickBar"]{ background: var(--primary); }
-.chat-input input{ background: var(--accent) !important; color: var(--fg) !important; border:1px solid var(--border); border-radius: 10px; padding:10px 12px; }
-.chat-send button{ background: linear-gradient(180deg, #0b485b, #083947); border:1px solid var(--primary-2); color: white; border-radius: 10px; padding:10px 14px; cursor:pointer; }
-.chat-send button:disabled{ background: linear-gradient(180deg, #1a222d, #121a24); border-color: var(--border); color: var(--muted-fg); cursor:not-allowed; }
 </style>
 """, unsafe_allow_html=True)
 
-# -------------- Top bar --------------
-st.markdown("""
+# -------------- Top bar (dynamique : pastilles vert/rouge) --------------
+def _pill_html(name: str, ok: bool, label: str) -> str:
+    cls = "dot ok" if ok else "dot bad"
+    safe_label = html.escape(label)
+    return f'<div class="pill"><div class="{cls}"></div><span>{name}</span><span class="muted">• {safe_label}</span></div>'
+
+ollama_up = is_ollama_up(CFG["ollama"]["host"])
+ollama_status = "Up" if ollama_up else "Down"
+
+servers = CFG.get("mcp", {}).get("servers", [])
+running = 0
+for s in servers:
+    sid = s.get("id") or s.get("name") or ""
+    if sid and _mcp_running(sid):
+        running += 1
+mcp_ok = running > 0
+mcp_label = f"{running}/{len(servers)}" if servers else "0/0"
+
+jarvis_running = bool(st.session_state.get("jarvis_running"))
+whisper_ok = jarvis_running
+whisper_label = "Ready" if whisper_ok else "Off"
+
+voice_path = _maybe_join_voice(CFG["piper"].get("base_dir", ""), CFG["piper"].get("voice", ""))
+piper_ok = jarvis_running and CFG["jarvis"].get("tts_engine") == "piper" and voice_path and os.path.exists(voice_path)
+piper_label = "Ready" if piper_ok else "Off"
+
+pill_whisper = _pill_html("WHISPER", whisper_ok, whisper_label)
+pill_piper   = _pill_html("PIPER",   piper_ok,   piper_label)
+pill_ollama  = _pill_html("OLLAMA",  ollama_up,  ollama_status)
+pill_mcp     = _pill_html("MCP",     mcp_ok,     mcp_label)
+
+st.markdown(
+    f"""
 <div class="topbar">
   <div class="status-row">
     <div class="status-left">
-      <div class="pill"><div class="dot"></div><span>WHISPER</span><span class="muted">• Ready</span></div>
-      <div class="pill"><div class="dot"></div><span>PIPER</span><span class="muted">• Ready</span></div>
-      <div class="pill"><div class="dot"></div><span>OLLAMA</span><span class="muted">• {status}</span></div>
-      <div class="pill"><div class="dot"></div><span>MCP</span><span class="muted">• cfg</span></div>
+      {pill_whisper}
+      {pill_piper}
+      {pill_ollama}
+      {pill_mcp}
     </div>
     <div></div>
   </div>
 </div>
-""".format(status=("Up" if is_ollama_up(CFG["ollama"]["host"]) else "Down")), unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+# -------------- Auto-start MCP (une seule fois par session) --------------
+if not st.session_state.mcp_autostart_done:
+    _apply_env_from_cfg(CFG)
+    for _s in CFG.get("mcp", {}).get("servers", []):
+        if _s.get("enabled") and _s.get("auto_start"):
+            _spawn_mcp_server(_s)
+    st.session_state.mcp_autostart_done = True
 
 # -------------- Tabs --------------
 tab_interface, tab_settings = st.tabs(["🎛️ Interface", "⚙️ Settings"])
@@ -587,10 +760,10 @@ with tab_interface:
             f'<div class="radar-label">{radar_label}</div></div>',
             unsafe_allow_html=True,
         )
-        st.markdown('<p class="muted" style="margin-top:8px;">Affichage compact. (Le backend micro/FFT est côté jarvis.py)</p></div>', unsafe_allow_html=True)
+        # st.markdown('<p class="muted" style="margin-top:8px;">Affichage compact. (Le backend micro/FFT est côté jarvis.py)</p></div>', unsafe_allow_html=True)
 
     with c2:
-        # --- Rendu du chat dans un slot UNIQUE pour éviter les div éclatés
+        # --- Chat: rendu des messages
         msgs = st.session_state.setdefault("messages", [])
 
         def _render_messages(messages: List[Dict[str, str]]) -> str:
@@ -624,9 +797,9 @@ with tab_interface:
             unsafe_allow_html=True
         )
 
-        # --- Commandes (toggle / input / bouton)
-        cols = st.columns([3, 8, 3])
-        with cols[0]:
+        # --- Commandes (toggle + formulaire d'envoi)
+        outer_cols = st.columns([3, 12])
+        with outer_cols[0]:
             st.markdown('<div class="chat-toggle">', unsafe_allow_html=True)
             st.toggle(
                 "🎙️ Mode vocal",
@@ -644,43 +817,44 @@ with tab_interface:
             else "MODE CHAT ACTIVÉ - Commence la conversation"
         )
 
-        with cols[1]:
-            st.markdown('<div class="chat-input">', unsafe_allow_html=True)
-            user_text = st.text_input(
-                "Message",
-                key="chat_input",
-                placeholder=placeholder_text,
-                label_visibility="collapsed",
-                disabled=(mode == "vocal"),
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
+        with outer_cols[1]:
+            # Formulaire : clear_on_submit évite toute écriture manuelle dans session_state du widget
+            with st.form("chat_form", clear_on_submit=True, border=False):
+                inner_cols = st.columns([8, 3])
+                with inner_cols[0]:
+                    user_text = st.text_area(
+                        "Message",
+                        key="chat_input",
+                        placeholder=placeholder_text,
+                        height=80,
+                        label_visibility="collapsed",
+                        disabled=(mode == "vocal"),
+                    )
+                with inner_cols[1]:
+                    submitted = st.form_submit_button(
+                        "Envoyer" if mode == "chat" else "🎤 Écoute",
+                        use_container_width=True,
+                        disabled=(mode != "chat"),
+                    )
 
-        with cols[2]:
-            st.markdown('<div class="chat-send">', unsafe_allow_html=True)
-            btn_label = "Envoyer" if mode == "chat" else "🎤 Écoute"
-            send_disabled = mode != "chat"
-            if st.button(btn_label, use_container_width=True, disabled=send_disabled, key="send_btn"):
-                if mode == "chat" and user_text and user_text.strip():
-                    clean_text = user_text.strip()
+            if submitted and mode == "chat":
+                clean_text = (user_text or "").strip()
+                if clean_text:
                     msgs.append({"role": "user", "content": clean_text})
-                    # TODO: remplacer par appel Ollama réel
-                    reply = "Réponse simulée (brancher Ollama)."
+                    # TODO: brancher Ollama ici
+                    reply = ollama_reply(CFG, msgs) or "Réponse vide d'Ollama (vérifie le modèle)."
                     msgs.append({"role": "assistant", "content": reply})
                     st.session_state["messages"] = msgs[-200:]
                     st.session_state.last_assistant_ts = time.time()
                     st.session_state.assistant_speaking = True
-                    st.session_state["chat_input"] = ""
                     st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
 
         if mode == "vocal":
             st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
 
-        # Indicateur d'état (utile au debug rapide)
         st.caption(f"Messages en mémoire: {len(st.session_state.get('messages', []))}")
 
 with tab_settings:
-    # Ajout d'un sous-onglet Jarvis pour audio local
     t0, t1, t2, t3, t4, t5 = st.tabs(["Jarvis", "Whisper", "Piper", "Ollama", "MCP", "💾 Sauvegarde"])
 
     with t0:
@@ -745,7 +919,6 @@ with tab_settings:
                 st.session_state.jarvis_mod = None
                 st.success("Module Jarvis sera rechargé au prochain démarrage.")
 
-        # Logs live
         if st.session_state.jarvis_running:
             drain_jarvis_logs()
         st.code("\n".join(st.session_state.get("jarvis_logbuf", [])) or "—", language="bash")
@@ -782,7 +955,8 @@ with tab_settings:
         if current_compute not in compute_options:
             current_compute = "int8"
         CFG["whisper"]["compute"] = st.selectbox(
-            "Compute", compute_options, index=compute_options.index(current_compute)
+            "Compute", compute_options,
+            index=compute_options.index(current_compute) if current_compute in compute_options else 0
         )
 
         CFG["whisper"]["prompt"] = st.text_area(
@@ -796,7 +970,6 @@ with tab_settings:
         CFG["piper"]["base_dir"] = st.text_input(
             "Dossier des voix (local serveur)", value=CFG["piper"].get("base_dir", "")
         ).strip()
-        # Uploaders
         up1, up2 = st.columns(2)
         with up1:
             up_onnx = st.file_uploader("Voice ONNX", type=["onnx"], accept_multiple_files=False, key="up_onnx")
@@ -810,7 +983,6 @@ with tab_settings:
                 saved = save_uploaded(up_json, CFG["piper"]["base_dir"])
                 if saved:
                     st.success(f"Enregistré : {saved}")
-        # Directory listing
         voice_files = []
         try:
             if os.path.isdir(CFG["piper"]["base_dir"]):
@@ -848,7 +1020,6 @@ with tab_settings:
     with t3:
         st.write("**Ollama**")
         CFG["ollama"]["host"] = st.text_input("Host", value=CFG["ollama"]["host"])
-        # List models from /api/tags
         models = fetch_ollama_models(CFG["ollama"]["host"])
         if models:
             idx = models.index(CFG["ollama"]["model"]) if CFG["ollama"]["model"] in models else 0
@@ -915,14 +1086,14 @@ with tab_settings:
 
         try:
             import importlib.util as _ilu
-
             mcp_installed = _ilu.find_spec("mcp") is not None
         except Exception:
             mcp_installed = False
         if not mcp_installed:
             st.info(
                 "Bibliothèque Python `mcp` introuvable. Installe-la (ex: `pip install modelcontextprotocol`)"
-                " pour permettre la découverte des outils.")
+                " pour permettre la découverte des outils."
+            )
 
         remove_index: Optional[int] = None
         if not servers:
@@ -985,6 +1156,24 @@ with tab_settings:
                 ).strip()
                 st.caption(f"Commande effective : `{cmd_preview}`")
 
+                sid = server["id"]
+                colx1, colx2, colx3 = st.columns([1, 1, 2])
+                with colx1:
+                    if st.button("▶️ Démarrer", key=f"mcp_start_{sid}"):
+                        _apply_env_from_cfg(CFG)
+                        _spawn_mcp_server(server)
+                with colx2:
+                    if st.button("⏹️ Stop", key=f"mcp_stop_{sid}"):
+                        _stop_mcp_server(sid)
+                with colx3:
+                    running = _mcp_running(sid)
+                    st.caption(("🟢 en cours" if running else "🔴 arrêté") + f" · log: {os.path.join('~/.jarvis/mcp-logs', sid + '.log')}")
+
+                if st.button("🔍 Lister tools", key=f"mcp_probe_{sid}"):
+                    tools = _probe_mcp_tools(server)
+                    if tools is not None:
+                        st.success(", ".join(tools) or "(aucun)")
+
                 if st.button("🗑️ Supprimer ce serveur", key=f"mcp_delete_{server_id}"):
                     remove_index = idx
 
@@ -1005,9 +1194,9 @@ with tab_settings:
                 st.cache_data.clear()
                 st.rerun()
 
-st.caption(f"Config: {CONFIG_PATH}")
+#st.caption(f"Config: {CONFIG_PATH}")
 
 # --- Auto-refresh quand Jarvis tourne en mode vocal ---
 if st.session_state.get("jarvis_running") and st.session_state.get("interaction_mode") == "vocal":
-    time.sleep(0.5)   # throttle pour ne pas surcharger
+    time.sleep(0.5)
     st.rerun()
