@@ -10,6 +10,5 @@ numpy>=1.24
 ollama>=0.1.30
 rapidfuzz>=3.9
 onnxruntime==1.18.1
-onnxruntime-gpu
 modelcontextprotocol>=0.1.0
 anyio>=4.0.0
