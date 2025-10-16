@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex, asyncio, copy
+import os, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex, asyncio, copy, math
 from typing import List, Dict, Any, Optional, Tuple, Union
 import streamlit as st
 import requests
@@ -549,6 +549,10 @@ if "last_assistant_ts" not in st.session_state:
     st.session_state.last_assistant_ts = 0.0
 if "assistant_speaking" not in st.session_state:
     st.session_state.assistant_speaking = False
+if "assistant_vu_level" not in st.session_state:
+    st.session_state.assistant_vu_level = 0.0
+if "assistant_vu_history" not in st.session_state:
+    st.session_state.assistant_vu_history = []
 if "mode_toggle" not in st.session_state:
     st.session_state.mode_toggle = False
 if "auto_refresh_chat" not in st.session_state:
@@ -642,8 +646,10 @@ def drain_jarvis_logs(max_keep: int = 800) -> List[str]:
     except Exception:
         pass
     if pulled:
-        st.session_state.jarvis_logbuf += pulled
-        st.session_state.jarvis_logbuf = st.session_state.jarvis_logbuf[-max_keep:]
+        displayable = [line for line in pulled if not str(line).startswith("[VU]")]
+        if displayable:
+            st.session_state.jarvis_logbuf += displayable
+            st.session_state.jarvis_logbuf = st.session_state.jarvis_logbuf[-max_keep:]
     return pulled
 
 def _update_speaking_state_from_logs(logs: List[str]):
@@ -651,11 +657,37 @@ def _update_speaking_state_from_logs(logs: List[str]):
     if not logs:
         return
     now = time.time()
-    for line in logs:
-        if line.strip().startswith("JARVIS:"):
-            st.session_state.last_assistant_ts = now
-            st.session_state.assistant_speaking = True
-            break
+    history = list(st.session_state.get("assistant_vu_history", []))
+    last_ts = float(st.session_state.get("last_assistant_ts", 0.0))
+    speaking = bool(st.session_state.get("assistant_speaking", False))
+    level = float(st.session_state.get("assistant_vu_level", 0.0))
+
+    for raw in logs:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        if line.startswith("[VU]"):
+            try:
+                level = max(0.0, min(1.0, float(line[4:]) if len(line) > 4 else 0.0))
+            except ValueError:
+                continue
+            history.append((now, level))
+            cutoff = now - 3.0
+            history = [(ts, val) for ts, val in history if ts >= cutoff]
+            if level > 0.03:
+                last_ts = now
+                speaking = True
+            elif now - last_ts > 0.6:
+                speaking = False
+            continue
+        if line.startswith("JARVIS:"):
+            last_ts = now
+            speaking = True
+
+    st.session_state.assistant_vu_history = history[-240:]
+    st.session_state.assistant_vu_level = level
+    st.session_state.last_assistant_ts = last_ts
+    st.session_state.assistant_speaking = speaking
 
 new_logs = drain_jarvis_logs() if st.session_state.jarvis_running else []
 if new_logs:
@@ -671,6 +703,8 @@ def _ingest_chat_from_logs(logs: List[str]):
     for raw in logs:
         line = (raw or "").strip()
         if not line:
+            continue
+        if line.startswith("[VU]"):
             continue
         m_user = re.match(r'^\[(?:STT|VOICE)\]\s*(?:Vous|You)\s*:\s*(.+)$', line, flags=re.IGNORECASE)
         if m_user:
@@ -824,10 +858,32 @@ if not st.session_state.mcp_autostart_done:
     st.session_state.mcp_autostart_done = True
 
 # ---------- Helper pour afficher le radar (dans un composant HTML dédié) ----------
-def render_radar(speaking: bool, mode: str):
+def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]]):
     svg_cls = "speaking" if speaking else ""
     center_cls = "speaking" if speaking else ""
     label = "Mode vocal" if mode == "vocal" else "Mode chat"
+
+    now = time.time()
+    history_payload: List[Dict[str, float]] = []
+    for entry in vu_history[-240:]:
+        try:
+            ts, val = entry
+        except (TypeError, ValueError):
+            continue
+        try:
+            stamp = float(ts)
+            level_val = float(val)
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(stamp) and math.isfinite(level_val)):
+            continue
+        level_val = max(0.0, min(1.0, level_val))
+        dt = max(0.0, now - stamp)
+        history_payload.append({"dt": dt, "level": level_val})
+
+    current_level = max(0.0, min(1.0, float(st.session_state.get("assistant_vu_level", 0.0))))
+    initial_level = history_payload[-1]["level"] if history_payload else current_level
+    history_json = json.dumps(history_payload, ensure_ascii=False)
 
     html_snippet = f"""
     <html>
@@ -882,7 +938,7 @@ def render_radar(speaking: bool, mode: str):
     <body>
       <div class="wrap">
         <h3 class="title">Radar Vocal</h3>
-        <div class="radar-container" data-speaking="{str(bool(speaking)).lower()}">
+        <div class="radar-container" data-speaking="{str(bool(speaking)).lower()}" data-level="{initial_level:.3f}">
           <svg class="{svg_cls}" viewBox="0 0 300 300" preserveAspectRatio="xMidYMid meet">
             <defs>
               <filter id="glow">
@@ -931,16 +987,42 @@ def render_radar(speaking: bool, mode: str):
           const container = document.querySelector('.radar-container');
           if (!container) {{ return; }}
           const svg = container.querySelector('svg');
+          if (!svg) {{ return; }}
           const waves = Array.from(svg.querySelectorAll('.wave'));
-          if (!waves.length) {{ return; }}
+          const centerCircle = svg.querySelector('.radar-center-circle');
+          if (!waves.length || !centerCircle) {{ return; }}
 
           const MIN_RADIUS = 35;
           const MAX_RADIUS = 140;
-          const CYCLE_MS = 1800;
-          const OFFSET_MS = CYCLE_MS / waves.length;
+          const BASE_CYCLE_MS = 1800;
+          const OFFSET_MS = BASE_CYCLE_MS / waves.length;
 
+          const payload = {history_json};
+          const nowBase = performance.now();
+          const initialLevel = Math.min(Math.max(parseFloat(container.dataset.level || '0') || 0, 0), 1);
+
+          let samples = Array.isArray(payload)
+            ? payload
+                .map((entry) => {{
+                  if (!entry) {{ return null; }}
+                  const lvl = Number(entry.level);
+                  const dt = Number(entry.dt);
+                  if (!Number.isFinite(lvl) || !Number.isFinite(dt)) {{ return null; }}
+                  const level = Math.min(Math.max(lvl, 0), 1);
+                  const age = Math.max(dt, 0);
+                  return {{ level, time: nowBase - age * 1000 }};
+                }})
+                .filter((item) => item !== null)
+                .sort((a, b) => a.time - b.time)
+            : [];
+
+          if (!samples.length) {{
+            samples.push({{ level: initialLevel, time: nowBase }});
+          }}
+
+          let smoothedLevel = samples[samples.length - 1]?.level ?? initialLevel;
           let speaking = svg.classList.contains('speaking');
-          let lastToggleTs = performance.now();
+          let lastToggleTs = nowBase;
 
           const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
           let prefersReducedMotion = reducedMotionQuery.matches;
@@ -953,6 +1035,7 @@ def render_radar(speaking: bool, mode: str):
                 wave.setAttribute('r', MIN_RADIUS.toString());
                 wave.style.opacity = '0';
               }});
+              centerCircle.setAttribute('r', '28');
             }} else {{
               lastToggleTs = performance.now();
             }}
@@ -966,25 +1049,28 @@ def render_radar(speaking: bool, mode: str):
 
           handleReducedMotion(reducedMotionQuery);
 
-          const syncSpeakingState = () => {{
-            const nextState = svg.classList.contains('speaking');
-            if (nextState !== speaking) {{
-              speaking = nextState;
-              container.setAttribute('data-speaking', String(speaking));
-              if (speaking) {{
-                lastToggleTs = performance.now();
-              }} else {{
-                waves.forEach((wave) => {{
-                  wave.setAttribute('r', MIN_RADIUS.toString());
-                  wave.style.opacity = '0';
-                }});
-              }}
+          const levelAt = (timeMs) => {{
+            if (!samples.length) {{
+              return svg.classList.contains('speaking') ? 0.2 : 0;
             }}
+            if (samples.length === 1) {{
+              return samples[0].level;
+            }}
+            let prev = samples[0];
+            if (timeMs <= prev.time) {{
+              return prev.level;
+            }}
+            for (let i = 1; i < samples.length; i += 1) {{
+              const sample = samples[i];
+              if (timeMs <= sample.time) {{
+                const span = Math.max(sample.time - prev.time, 1);
+                const ratio = Math.min(Math.max((timeMs - prev.time) / span, 0), 1);
+                return prev.level + (sample.level - prev.level) * ratio;
+              }}
+              prev = sample;
+            }}
+            return prev.level;
           }};
-
-          const observer = new MutationObserver(syncSpeakingState);
-          observer.observe(svg, {{ attributes: true, attributeFilter: ['class'] }});
-          syncSpeakingState();
 
           const animate = (now) => {{
             if (prefersReducedMotion) {{
@@ -992,22 +1078,58 @@ def render_radar(speaking: bool, mode: str):
               return;
             }}
 
-            syncSpeakingState();
+            samples = samples.filter((sample) => now - sample.time <= 2600);
+            if (!samples.length) {{
+              samples.push({{ level: 0, time: now }});
+            }}
+
+            const rawLevel = Math.min(Math.max(levelAt(now), 0), 1);
+            smoothedLevel = smoothedLevel * 0.65 + rawLevel * 0.35;
+
+            const attrSpeaking = svg.classList.contains('speaking');
+            const speakingNow = attrSpeaking || smoothedLevel > 0.04;
+            if (speakingNow !== speaking) {{
+              speaking = speakingNow;
+              container.setAttribute('data-speaking', String(speaking));
+              if (speaking && !attrSpeaking) {{
+                svg.classList.add('speaking');
+              }} else if (!speaking && attrSpeaking) {{
+                svg.classList.remove('speaking');
+              }}
+              if (speaking) {{
+                lastToggleTs = now;
+              }} else {{
+                waves.forEach((wave) => {{
+                  wave.setAttribute('r', MIN_RADIUS.toString());
+                  wave.style.opacity = '0';
+                }});
+              }}
+            }}
+
+            const visualLevel = smoothedLevel > 0.015 ? smoothedLevel : (speakingNow ? 0.12 : 0);
+            container.dataset.level = visualLevel.toFixed(3);
+
+            const cycleMs = speakingNow ? BASE_CYCLE_MS * (1 - Math.min(visualLevel, 0.6) * 0.35) : BASE_CYCLE_MS * 1.1;
+
             waves.forEach((wave, index) => {{
-              const elapsed = now - lastToggleTs - (index * OFFSET_MS);
-              if (!speaking || elapsed < 0) {{
+              const elapsed = now - lastToggleTs - index * OFFSET_MS;
+              if (!speakingNow || elapsed < 0) {{
                 wave.setAttribute('r', MIN_RADIUS.toString());
                 wave.style.opacity = '0';
                 return;
               }}
 
-              const progress = (elapsed % CYCLE_MS) / CYCLE_MS;
-              const radius = MIN_RADIUS + (MAX_RADIUS - MIN_RADIUS) * progress;
-              const opacity = Math.max(0, 1 - progress);
+              const progress = (elapsed % cycleMs) / cycleMs;
+              const maxRadius = MIN_RADIUS + (MAX_RADIUS - MIN_RADIUS) * visualLevel;
+              const radius = MIN_RADIUS + (maxRadius - MIN_RADIUS) * progress;
+              const opacity = Math.max(0, (1 - progress) * (0.35 + visualLevel * 0.55));
 
               wave.setAttribute('r', radius.toFixed(2));
               wave.style.opacity = opacity.toFixed(2);
             }});
+
+            const centerRadius = 28 + visualLevel * 10;
+            centerCircle.setAttribute('r', centerRadius.toFixed(2));
 
             requestAnimationFrame(animate);
           }};
@@ -1036,7 +1158,11 @@ with tab_interface:
     c1, c2 = st.columns([5,7])
     with c1:
         # Radar dans un composant HTML isolé (SVG autorisé)
-        render_radar(speaking=speaking, mode=mode)
+        render_radar(
+            speaking=speaking,
+            mode=mode,
+            vu_history=st.session_state.get("assistant_vu_history", []),
+        )
 
     with c2:
         msgs = st.session_state.setdefault("messages", [])
@@ -1612,5 +1738,5 @@ if (
     and st.session_state.get("auto_refresh_chat", False)
     and (time.time() - st.session_state.get("last_assistant_ts", 0.0)) < 10
 ):
-    time.sleep(0.5)
+    time.sleep(0.3)
     st.rerun()

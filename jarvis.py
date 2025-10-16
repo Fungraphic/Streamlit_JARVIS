@@ -126,6 +126,14 @@ def log(msg: str):
     except Exception: pass
 
 
+def log_vu(level: float):
+    """Envoie un niveau VU (0-1) vers l'UI sans polluer stdout."""
+    try:
+        q_log.put_nowait(f"[VU]{max(0.0, min(1.0, float(level))):.3f}")
+    except Exception:
+        pass
+
+
 def _reserve_wav_path(prefix: str) -> str:
     """Return a unique temporary WAV path created atomically."""
     tmp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".wav", delete=False)
@@ -609,6 +617,7 @@ class TTS:
     def speak(self, text: str):
         if not text:
             return
+        log_vu(0.0)
         log(f"JARVIS: {text}")
         if not _say_fallback(text, self.lang_id) and not self._warned:
             log("[TTS] Aucun moteur TTS système détecté (espeak/say). Le texte est affiché uniquement.")
@@ -714,6 +723,8 @@ class PiperTTS:
                 proc.stdin.close()
             except Exception:
                 pass
+            vu_level = 0.0
+            log_vu(0.0)
 
             with sd.RawOutputStream(
                 samplerate=self.sample_rate, channels=1, dtype="int16",
@@ -724,6 +735,18 @@ class PiperTTS:
                     if not chunk:
                         break
                     stream.write(chunk)
+                    if len(chunk) < 2:
+                        continue
+                    try:
+                        samples = np.frombuffer(chunk, dtype=np.int16)
+                        if samples.size:
+                            floats = samples.astype(np.float32) / 32768.0
+                            inst_level = float(np.sqrt(np.mean(np.square(floats))))
+                            inst_level = min(1.0, max(0.0, inst_level * 1.6))
+                            vu_level = (vu_level * 0.65) + (inst_level * 0.35)
+                            log_vu(vu_level)
+                    except Exception:
+                        continue
             proc.wait(timeout=5)
         except Exception as e:
             log(f"[TTS] Piper streaming erreur: {e}")
@@ -751,6 +774,8 @@ class PiperTTS:
             finally:
                 try: os.remove(tmp)
                 except Exception: pass
+        finally:
+            log_vu(0.0)
 
     @property
     def clone_once(self) -> bool:
