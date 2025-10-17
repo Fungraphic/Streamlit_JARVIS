@@ -7,16 +7,12 @@ import streamlit as st
 import requests
 import streamlit.components.v1 as components  # <- pour l'iframe HTML du radar
 
-try:
-    import yaml  # type: ignore
-except Exception:
-    yaml = None  # Optionnel : utilisé pour MCPJungle
-
 st.set_page_config(page_title="Jarvis — Streamlit UI (style shadcn) v3", layout="wide")
 
 # -------------- Persistence --------------
 CONFIG_DIR = os.path.expanduser("~/.jarvis")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "ui_config.json")
+
 DEFAULT_CFG: Dict[str, Any] = {
     "whisper": {
         "model": "small",
@@ -43,24 +39,13 @@ DEFAULT_CFG: Dict[str, Any] = {
         "num_ctx": 4096,
         "stream": False,
     },
+    # --- MCP: configuration simplifiée (via MCPJungle Gateway) ---
     "mcp": {
-        "servers": [],
-        "proxy": {
-            "enabled": False,
-            "command": "",
-            "args": [],
-            "env": {},
-            "tool_timeout_s": 60,
-            "chat_shortcuts": True,
-            "auto_web": False,
-            "auto_web_topk": 5
-        },
-        "jungle": {
+        "gateway": {
             "enabled": True,
-            "repo_path": "",
-            "selected": [],
-            "last_scan": 0,
-        },
+            "base_url": "http://127.0.0.1:8080",  # ou un endpoint de groupe, ex: http://127.0.0.1:8080/v0/groups/<name>/mcp
+            "auth_header": ""                      # ex: "Bearer xxxxx"
+        }
     },
     "jarvis": {
         "path": "./jarvis.py",
@@ -78,77 +63,25 @@ DEFAULT_CFG: Dict[str, Any] = {
 MCP_LOG_DIR = os.path.join(CONFIG_DIR, "mcp-logs")
 os.makedirs(MCP_LOG_DIR, exist_ok=True)
 
-def _normalize_mcp_servers(cfg: Dict[str, Any]) -> None:
-    """Normalize 'mcp.servers' et 'mcp.proxy' dict."""
+def _normalize_mcp_gateway(cfg: Dict[str, Any]) -> None:
+    """
+    Normalise la section MCP pour la nouvelle topologie 'gateway'.
+    - Écrase les anciens champs 'servers', 'proxy', 'jungle' s'ils existent.
+    """
     mcp = cfg.setdefault("mcp", {})
-    servers = mcp.get("servers", []) or []
-    normalized: List[Dict[str, Any]] = []
-    for idx, entry in enumerate(servers):
-        server: Dict[str, Any]
-        if isinstance(entry, str):
+    gw = mcp.get("gateway") or {}
+    mcp["gateway"] = {
+        "enabled": bool(gw.get("enabled", True)),
+        "base_url": str(gw.get("base_url", "http://127.0.0.1:8080")),
+        "auth_header": str(gw.get("auth_header", "")),
+    }
+    # purge legacy clés si présentes
+    for legacy in ("servers", "proxy", "jungle"):
+        if legacy in mcp:
             try:
-                parts = shlex.split(entry)
+                del mcp[legacy]
             except Exception:
-                parts = entry.split()
-            command = parts[0] if parts else entry.strip()
-            args = parts[1:] if len(parts) > 1 else []
-            server = {
-                "id": f"srv_{idx+1}",
-                "name": command or f"Serveur {idx+1}",
-                "command": command,
-                "args": args,
-                "env": {},
-                "enabled": True,
-                "auto_start": True,
-            }
-        elif isinstance(entry, dict):
-            server = {
-                "id": entry.get("id") or entry.get("name") or f"srv_{idx+1}",
-                "name": entry.get("name") or entry.get("id") or f"Serveur {idx+1}",
-                "command": entry.get("command") or "",
-                "args": entry.get("args") or [],
-                "env": entry.get("env") or {},
-                "enabled": bool(entry.get("enabled", True)),
-                "auto_start": bool(entry.get("auto_start", True)),
-            }
-        else:
-            continue
-        if not server.get("id"):
-            server["id"] = uuid.uuid4().hex[:8]
-        if not isinstance(server.get("args"), list):
-            raw_args = server.get("args")
-            if isinstance(raw_args, str):
-                try:
-                    server["args"] = shlex.split(raw_args)
-                except Exception:
-                    server["args"] = raw_args.split()
-            else:
-                server["args"] = []
-        if not isinstance(server.get("env"), dict):
-            server["env"] = {}
-        extras = {k: copy.deepcopy(v) for k, v in entry.items() if k not in {"id", "name", "command", "args", "env", "enabled", "auto_start"}}
-        for k, v in extras.items():
-            server[k] = v
-        normalized.append(server)
-    mcp["servers"] = normalized
-    proxy = mcp.get("proxy", {}) or {}
-    mcp["proxy"] = {
-        "enabled": bool(proxy.get("enabled", False)),
-        "command": str(proxy.get("command", "")),
-        "args": proxy.get("args") or [],
-        "env": proxy.get("env") or {},
-        "tool_timeout_s": int(proxy.get("tool_timeout_s", 60)),
-        "chat_shortcuts": bool(proxy.get("chat_shortcuts", True)),
-        "auto_web": bool(proxy.get("auto_web", False)),
-        "auto_web_topk": int(proxy.get("auto_web_topk", 5)),
-    }
-    jungle = mcp.get("jungle", {}) or {}
-    mcp["jungle"] = {
-        "enabled": bool(jungle.get("enabled", True)),
-        "repo_path": str(jungle.get("repo_path", "")),
-        "selected": list(jungle.get("selected", []) or []),
-        "last_scan": float(jungle.get("last_scan", 0.0)),
-    }
+                pass
 
 def load_cfg() -> Dict[str, Any]:
     """Charge la config depuis le fichier ou retourne la config par défaut."""
@@ -157,17 +90,18 @@ def load_cfg() -> Dict[str, Any]:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 cfg = copy.deepcopy(DEFAULT_CFG)
+                # merge shallow par section
                 for k, v in (data or {}).items():
                     if isinstance(v, dict):
                         cfg[k] = {**cfg.get(k, {}), **copy.deepcopy(v)}
                     else:
                         cfg[k] = v
-                _normalize_mcp_servers(cfg)
+                _normalize_mcp_gateway(cfg)
                 return cfg
     except Exception as e:
         st.warning(f"Lecture config échouée: {e}")
     cfg = copy.deepcopy(DEFAULT_CFG)
-    _normalize_mcp_servers(cfg)
+    _normalize_mcp_gateway(cfg)
     return cfg
 
 def save_cfg(cfg: Dict[str, Any]):
@@ -228,7 +162,8 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
         "OLLAMA_TEMPERATURE": str(ollama_cfg.get("temperature", 0.7)),
         "OLLAMA_NUM_CTX": str(ollama_cfg.get("num_ctx", 4096)),
         "OLLAMA_STREAM": "1" if ollama_cfg.get("stream") else "0",
-        "MCP_SERVERS_JSON": json.dumps(cfg.get("mcp", {}).get("servers", []), ensure_ascii=False),
+        # compat: plus de liste de serveurs locale => passe un tableau vide
+        "MCP_SERVERS_JSON": "[]",
     }
     for key, value in env_map.items():
         if value is None:
@@ -374,7 +309,7 @@ def save_uploaded(file, dest_dir: str) -> Optional[str]:
         st.error(f"Enregistrement échoué: {e}")
         return None
 
-# -------------- MCP: client helpers (stdio & proxy) --------------
+# -------------- MCP Gateway (HTTP/SSE) --------------
 def _mcp_import_ok() -> bool:
     """Vérifie si le SDK MCP est disponible."""
     try:
@@ -417,328 +352,76 @@ def _fmt_call_result(result: Any) -> str:
     out = "\n".join([p for p in parts if p]) or "(vide)"
     return out
 
-def _merge_env(env: Optional[Dict[str,str]]) -> Dict[str,str]:
-    """Fusionne l'env fourni avec l'env courant."""
-    merged = os.environ.copy()
-    for k, v in (env or {}).items():
-        merged[str(k)] = str(v)
-    return merged
+def _mcp_gateway_cfg() -> Dict[str, Any]:
+    return (CFG.get("mcp", {}).get("gateway") or {})
 
-_MCPJ_SKIP_DIRS = {".git", "node_modules", "__pycache__", "build", "dist", ".venv", ".mypy_cache"}
+def mcp_list_tools_via_gateway() -> List[str]:
+    """Liste les tools du gateway MCPJungle. Préfère Streamable HTTP (/mcp), fallback SSE (/sse)."""
+    gw = _mcp_gateway_cfg()
+    base = (gw.get("base_url", "") or "").rstrip("/")
+    headers = {}
+    if gw.get("auth_header"):
+        headers["Authorization"] = gw["auth_header"]
 
-def _safe_mcp_id(raw: Optional[str], fallback: str) -> str:
-    base = (raw or "").strip() or fallback
-    base = re.sub(r"[^a-zA-Z0-9_.-]+", "-", base)
-    base = base.strip("-_") or fallback
-    return base[:60]
-
-def _listify_args(args: Union[str, List[Any], None]) -> List[str]:
-    if args is None:
-        return []
-    if isinstance(args, list):
-        return [str(a) for a in args if a not in (None, "")]
-    if isinstance(args, str):
-        try:
-            return [a for a in shlex.split(args) if a]
-        except Exception:
-            return [a for a in args.split() if a]
-    return []
-
-def _dictify_env(env: Any) -> Dict[str, str]:
-    if not isinstance(env, dict):
-        return {}
-    out: Dict[str, str] = {}
-    for k, v in env.items():
-        if k:
-            out[str(k)] = "" if v is None else str(v)
-    return out
-
-def _extract_jungle_entries(payload: Any, source: str, results: Dict[str, Dict[str, Any]]):
-    if payload is None:
-        return
-    if isinstance(payload, list):
-        for item in payload:
-            _extract_jungle_entries(item, source, results)
-        return
-    if not isinstance(payload, dict):
-        return
-
-    command = payload.get("command")
-    args = payload.get("args")
-    env = payload.get("env")
-    runner = payload.get("runner") or payload.get("run") or payload.get("start")
-    if isinstance(runner, dict):
-        command = command or runner.get("command") or runner.get("cmd") or runner.get("binary")
-        if not args:
-            args = runner.get("args") or runner.get("argv") or runner.get("arguments")
-        if not env:
-            env = runner.get("env")
-
-    command = (command or "").strip()
-    cmd_args = _listify_args(args)
-    env_dict = _dictify_env(env)
-
-    candidate_id = payload.get("id") or payload.get("slug") or payload.get("name")
-    rel_source = source
-    server_id = _safe_mcp_id(str(candidate_id) if candidate_id else None, Path(source).stem)
-
-    description = payload.get("description") or payload.get("summary") or payload.get("about") or ""
-    tags = []
-    if isinstance(payload.get("tags"), list):
-        tags = [str(t) for t in payload.get("tags") if t]
-    elif isinstance(payload.get("tags"), str):
-        tags = [t.strip() for t in payload.get("tags").split(",") if t.strip()]
-
-    homepage = ""
-    links = payload.get("links") or payload.get("link")
-    if isinstance(links, dict):
-        homepage = links.get("homepage") or links.get("home") or links.get("docs") or ""
-    elif isinstance(links, list):
-        for link in links:
-            if isinstance(link, str) and not homepage:
-                homepage = link
-            elif isinstance(link, dict) and not homepage:
-                homepage = link.get("url") or ""
-
-    if command:
-        entry = {
-            "id": server_id,
-            "name": str(payload.get("name") or payload.get("title") or server_id),
-            "command": command,
-            "args": cmd_args,
-            "env": env_dict,
-            "enabled": True,
-            "auto_start": bool(payload.get("auto_start", True)),
-            "description": str(description),
-            "tags": tags,
-            "homepage": str(homepage),
-            "source": f"mcpjungle:{rel_source}",
-            "origin_file": rel_source,
-        }
-        results[entry["id"]] = entry
-
-    for key in ("servers", "items", "catalog", "definitions"):
-        if isinstance(payload.get(key), list):
-            _extract_jungle_entries(payload.get(key), source, results)
-
-
-@st.cache_data(show_spinner=False)
-def load_mcpjungle_catalog(repo_path: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-    repo = os.path.abspath(os.path.expanduser(repo_path or ""))
-    if not repo:
-        return [], []
-    if not os.path.isdir(repo):
-        return [], [f"Répertoire MCPJungle introuvable: {repo}"]
-
-    entries: Dict[str, Dict[str, Any]] = {}
-    warnings: List[str] = []
-    walker = os.walk(repo)
-    for root, dirs, files in walker:
-        dirs[:] = [d for d in dirs if d not in _MCPJ_SKIP_DIRS]
-        for fname in files:
-            lower = fname.lower()
-            if lower.endswith(".json"):
-                path = os.path.join(root, fname)
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    rel = os.path.relpath(path, repo)
-                    _extract_jungle_entries(data, rel, entries)
-                except Exception as e:
-                    warnings.append(f"Impossible de lire {fname}: {e}")
-            elif lower.endswith((".yaml", ".yml")):
-                if not yaml:
-                    msg = "PyYAML non installé — fichiers YAML ignorés."
-                    if msg not in warnings:
-                        warnings.append(msg)
-                    continue
-                path = os.path.join(root, fname)
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = yaml.safe_load(f)
-                    rel = os.path.relpath(path, repo)
-                    _extract_jungle_entries(data, rel, entries)
-                except Exception as e:
-                    warnings.append(f"Impossible de lire {fname}: {e}")
-
-    ordered = sorted(entries.values(), key=lambda e: (e.get("name") or e.get("id")))
-    return ordered, warnings
-
-
-def _ensure_unique_server_id(existing: List[Dict[str, Any]], base_id: str) -> str:
-    ids = {s.get("id") for s in existing}
-    if base_id not in ids:
-        return base_id
-    suffix = 2
-    while f"{base_id}_{suffix}" in ids:
-        suffix += 1
-    return f"{base_id}_{suffix}"
-
-
-def import_mcpjungle_server(entry: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
-    mcp_cfg = cfg.setdefault("mcp", {})
-    servers = mcp_cfg.setdefault("servers", [])
-    entry_id = entry.get("id") or uuid.uuid4().hex[:8]
-    target_id = _ensure_unique_server_id(servers, entry_id)
-    new_server = {
-        "id": target_id,
-        "name": entry.get("name") or target_id,
-        "command": entry.get("command", ""),
-        "args": entry.get("args") or [],
-        "env": entry.get("env") or {},
-        "enabled": True,
-        "auto_start": bool(entry.get("auto_start", True)),
-    }
-    extra_keys = {k: v for k, v in entry.items() if k not in new_server}
-    for k, v in extra_keys.items():
-        new_server[k] = copy.deepcopy(v)
-
-    # Recherche d'un serveur existant basé sur la source
-    existing = None
-    source = entry.get("source")
-    if source:
-        for server in servers:
-            if server.get("source") == source:
-                existing = server
-                break
-    if existing is None:
-        servers.append(new_server)
-        existing = new_server
-    else:
-        existing.update(new_server)
-    return existing
-
-def mcp_list_tools_via_stdio(command: str, args: List[str], env: Dict[str, str]) -> List[str]:
-    """Liste les tools d'un serveur MCP via stdio."""
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-    merged_env = _merge_env(env)
-    cfg_path = merged_env.get("MCP_CONFIG_PATH")
-    if cfg_path and not os.path.isfile(cfg_path):
-        raise FileNotFoundError(f"[MCP] MCP_CONFIG_PATH introuvable: {cfg_path}")
-    params = StdioServerParameters(command=command, args=args or [], env=merged_env)
-    async def _go():
-        async with stdio_client(params) as (r, w):
-            async with ClientSession(r, w) as sess:
-                await sess.initialize()
-                resp = await sess.list_tools()
-                return [t.name for t in (resp.tools or [])]
-    return asyncio.run(_go())
-
-def mcp_call_tool_via_stdio(command: str, args: List[str], env: Dict[str, str],
-                            tool: str, arguments: Dict[str, Any], timeout_s: int = 60) -> str:
-    """Appelle un tool via un process stdio éphémère."""
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-    merged_env = _merge_env(env)
-    cfg_path = merged_env.get("MCP_CONFIG_PATH")
-    if cfg_path and not os.path.isfile(cfg_path):
-        return f"[MCP] MCP_CONFIG_PATH introuvable: {cfg_path}"
-    params = StdioServerParameters(command=command, args=args or [], env=merged_env)
-    async def _go():
-        async with stdio_client(params) as (r, w):
-            async with ClientSession(r, w) as sess:
-                await sess.initialize()
-                try:
-                    res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
-                except asyncio.TimeoutError:
-                    return "[MCP] Timeout d'exécution du tool."
-                return _fmt_call_result(res)
-    return asyncio.run(_go())
-
-# --- shortcuts haut-niveau (DDG) ---
-def _proxy_cfg() -> Dict[str, Any]:
-    return CFG.get("mcp", {}).get("proxy", {}) or {}
-
-def ddg_search(query: str, topk: int = 5) -> str:
-    """Recherche via DuckDuckGo via MCP proxy."""
-    p = _proxy_cfg()
+    # Streamable HTTP d'abord
     try:
-        args = {"query": query, "max_results": int(topk)}
-        out = mcp_call_tool_via_stdio(p.get("command",""), p.get("args") or [], p.get("env") or {},
-                                      "search", args, timeout_s=int(p.get("tool_timeout_s",60)))
-        return out or "(vide)"
-    except Exception as e:
-        return f"[MCP/search] {e}"
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client  # SDK Python récent
+        async def _go():
+            async with streamablehttp_client(f"{base}/mcp", headers=headers) as (r, w, _):
+                async with ClientSession(r, w) as sess:
+                    await sess.initialize()
+                    resp = await sess.list_tools()
+                    return [t.name for t in (resp.tools or [])]
+        return asyncio.run(_go())
+    except Exception:
+        # Fallback SSE
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+        async def _go_sse():
+            async with sse_client(f"{base}/sse", headers=headers) as (r, w):
+                async with ClientSession(r, w) as sess:
+                    await sess.initialize()
+                    resp = await sess.list_tools()
+                    return [t.name for t in (resp.tools or [])]
+        return asyncio.run(_go_sse())
 
-def ddg_fetch(url: str) -> str:
-    """Récupère le contenu d'une URL via MCP proxy."""
-    p = _proxy_cfg()
+def mcp_call_tool_via_gateway(tool: str, arguments: Dict[str, Any], timeout_s: int = 60) -> str:
+    """Appelle un tool via le gateway MCPJungle."""
+    gw = _mcp_gateway_cfg()
+    base = (gw.get("base_url", "") or "").rstrip("/")
+    headers = {}
+    if gw.get("auth_header"):
+        headers["Authorization"] = gw["auth_header"]
+
+    # Streamable HTTP
     try:
-        args = {"url": url}
-        out = mcp_call_tool_via_stdio(p.get("command",""), p.get("args") or [], p.get("env") or {},
-                                      "fetch_content", args, timeout_s=int(p.get("tool_timeout_s",60)))
-        return out or "(vide)"
-    except Exception as e:
-        return f"[MCP/fetch_content] {e}"
-
-# -------------- gestion des serveurs MCP (spawn/stop/probe legacy) --------------
-if "mcp_procs" not in st.session_state:
-    st.session_state.mcp_procs = {}
-if "mcp_autostart_done" not in st.session_state:
-    st.session_state.mcp_autostart_done = False
-
-def _server_key(s: Dict[str, Any]) -> str:
-    return s.get("id") or s.get("name") or uuid.uuid4().hex[:8]
-
-def _server_cmd(s: Dict[str, Any]) -> List[str]:
-    cmd = (s.get("command") or "").strip()
-    args = s.get("args") or []
-    return [cmd] + [a for a in args if a]
-
-def _spawn_mcp_server(s: Dict[str, Any]) -> bool:
-    """Démarre un serveur MCP."""
-    sid = _server_key(s)
-    p = st.session_state.mcp_procs.get(sid)
-    if p and p.poll() is None:
-        return True
-    cmd = _server_cmd(s)
-    if not cmd or not cmd[0]:
-        st.error(f"[MCP] Commande vide pour {sid}")
-        return False
-    env = os.environ.copy()
-    for k, v in (s.get("env") or {}).items():
-        if k and v is not None:
-            env[str(k)] = str(v)
-    log_path = os.path.join(MCP_LOG_DIR, f"{sid}.log")
-    try:
-        out = open(log_path, "ab", buffering=0)
-        p = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
-        st.session_state.mcp_procs[sid] = p
-        return True
-    except Exception as e:
-        st.error(f"[MCP] Échec lancement {sid}: {e}")
-        return False
-
-def _stop_mcp_server(sid: str):
-    """Arrête un serveur MCP."""
-    p = st.session_state.mcp_procs.get(sid)
-    if not p:
-        return
-    try:
-        p.terminate()
-        try:
-            p.wait(timeout=2)
-        except Exception:
-            p.kill()
-    finally:
-        st.session_state.mcp_procs.pop(sid, None)
-
-def _mcp_running(sid: str) -> bool:
-    """Vérifie si un serveur MCP est en cours d'exécution."""
-    p = st.session_state.mcp_procs.get(sid)
-    return bool(p and p.poll() is None)
-
-def _probe_mcp_tools(s: Dict[str, Any]) -> Optional[List[str]]:
-    """Teste les tools d'un serveur MCP."""
-    if not _mcp_import_ok():
-        st.warning("SDK MCP Python introuvable (`pip install mcp` ou `pip install modelcontextprotocol`).")
-        return None
-    try:
-        return mcp_list_tools_via_stdio(s.get("command",""), s.get("args") or [], s.get("env") or {})
-    except Exception as e:
-        st.error(f"Probe tools a échoué: {e}")
-        return None
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+        async def _go():
+            async with streamablehttp_client(f"{base}/mcp", headers=headers) as (r, w, _):
+                async with ClientSession(r, w) as sess:
+                    await sess.initialize()
+                    try:
+                        res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
+                    except asyncio.TimeoutError:
+                        return "[MCP] Timeout d'exécution du tool."
+                    return _fmt_call_result(res)
+        return asyncio.run(_go())
+    except Exception:
+        # Fallback SSE
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+        async def _go_sse():
+            async with sse_client(f"{base}/sse", headers=headers) as (r, w):
+                async with ClientSession(r, w) as sess:
+                    await sess.initialize()
+                    try:
+                        res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
+                    except asyncio.TimeoutError:
+                        return "[MCP] Timeout d'exécution du tool."
+                    return _fmt_call_result(res)
+        return asyncio.run(_go_sse())
 
 # -------------- Jarvis runtime (local) --------------
 if "jarvis_mod" not in st.session_state:
@@ -762,7 +445,7 @@ if "assistant_vu_history" not in st.session_state:
 if "mode_toggle" not in st.session_state:
     st.session_state.mode_toggle = False
 if "auto_refresh_chat" not in st.session_state:
-    st.session_state.auto_refresh_chat = False  # désactivé par défaut (évite blocage boutons)
+    st.session_state.auto_refresh_chat = False  # désactivé par défaut
 
 def _set_interaction_mode(mode: str):
     """Définit le mode d'interaction (vocal ou chat)."""
@@ -937,7 +620,6 @@ def _ort_providers() -> Tuple[List[str], str]:
     try:
         import onnxruntime as ort
         provs = list(ort.get_available_providers())
-        # Renvoie un label lisible
         label = "CPU"
         if "TensorrtExecutionProvider" in provs:
             label = "TensorRT"
@@ -1010,14 +692,11 @@ def _pill_html(name: str, ok: bool, label: str) -> str:
 ollama_up = is_ollama_up(CFG["ollama"]["host"])
 ollama_status = "Up" if ollama_up else "Down"
 
-servers = CFG.get("mcp", {}).get("servers", [])
-running = 0
-for s in servers:
-    sid = s.get("id") or s.get("name") or ""
-    if sid and _mcp_running(sid):
-        running += 1
-mcp_ok = running > 0
-mcp_label = f"{running}/{len(servers)}" if servers else "0/0"
+# Statut MCP: simple (activé ?), libellé = host
+gw = CFG.get("mcp", {}).get("gateway", {})
+mcp_ok = bool(gw.get("enabled", False))
+mcp_host_label = gw.get("base_url", "") or "off"
+pill_mcp = _pill_html("MCP", mcp_ok, mcp_host_label)
 
 jarvis_running = bool(st.session_state.get("jarvis_running"))
 whisper_ok = jarvis_running
@@ -1035,7 +714,6 @@ pill_ort = _pill_html("ONNXRT", ort_ok, ort_label)
 pill_whisper = _pill_html("WHISPER", whisper_ok, whisper_label)
 pill_piper   = _pill_html("PIPER",   piper_ok,   piper_label)
 pill_ollama  = _pill_html("OLLAMA",  ollama_up,  ollama_status)
-pill_mcp     = _pill_html("MCP",     mcp_ok,     mcp_label)
 
 st.markdown(
     f"""
@@ -1054,14 +732,6 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
-# -------------- Auto-start MCP legacy (une seule fois par session) --------------
-if not st.session_state.mcp_autostart_done:
-    _apply_env_from_cfg(CFG)
-    for _s in CFG.get("mcp", {}).get("servers", []):
-        if _s.get("enabled") and _s.get("auto_start"):
-            _spawn_mcp_server(_s)
-    st.session_state.mcp_autostart_done = True
 
 # ---------- Helper pour afficher le radar (dans un composant HTML dédié) ----------
 def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]]):
@@ -1363,7 +1033,7 @@ with tab_interface:
 
     c1, c2 = st.columns([5,7])
     with c1:
-        # Radar dans un composant HTML isolé (SVG autorisé)
+        # Radar
         render_radar(
             speaking=speaking,
             mode=mode,
@@ -1404,7 +1074,7 @@ with tab_interface:
             unsafe_allow_html=True
         )
 
-        # --- Commandes (toggles rapides + formulaire d'envoi)
+        # --- Commandes
         outer_cols = st.columns([3, 12])
         with outer_cols[0]:
             st.markdown('<div class="chat-toggle">', unsafe_allow_html=True)
@@ -1415,25 +1085,17 @@ with tab_interface:
                 help="Active le mode vocal pour répondre par la voix",
                 on_change=_sync_mode_from_toggle,
             )
-            # --- Websearch: raccourci global (contrôle le proxy MCP)
+
             st.divider()
-            st.write("🔎 **Websearch (MCP)**")
-            CFG["mcp"]["proxy"]["enabled"] = st.toggle(
-                "Activer le proxy de recherche",
-                value=bool(CFG["mcp"]["proxy"].get("enabled", False)),
-                help="Active /web, /ddg et les outils MCP via le proxy."
+            st.write("🔎 **MCP Gateway**")
+            gw_enabled = CFG["mcp"]["gateway"].get("enabled", True)
+            CFG["mcp"]["gateway"]["enabled"] = st.toggle(
+                "Activer le gateway MCPJungle",
+                value=bool(gw_enabled),
+                help="Expose tous tes tools via un endpoint unique."
             )
-            CFG["mcp"]["proxy"]["auto_web"] = st.toggle(
-                "Auto-web (pré-recherche DDG)",
-                value=bool(CFG["mcp"]["proxy"].get("auto_web", False))
-            )
-            # clé unique pour éviter collision
-            CFG["mcp"]["proxy"]["auto_web_topk"] = st.number_input(
-                "Top-K DDG",
-                min_value=1, max_value=20,
-                value=int(CFG["mcp"]["proxy"].get("auto_web_topk", 5)), step=1,
-                key="topk_ddg_interface"
-            )
+            st.caption("Raccourci chat: `/tool <nom> {json}`  → appelle le tool via le gateway.")
+
             st.divider()
             st.write("🔄 **Rafraîchissement**")
             st.session_state.auto_refresh_chat = st.toggle(
@@ -1447,7 +1109,7 @@ with tab_interface:
         placeholder_text = (
             "MODE VOCAL ACTIVÉ - Utilise ton micro"
             if mode == "vocal"
-            else "MODE CHAT ACTIVÉ - Commence la conversation (astuce: /web ta requête)"
+            else "MODE CHAT ACTIVÉ - Commence la conversation (astuce: /tool nom {json})"
         )
 
         with outer_cols[1]:
@@ -1472,73 +1134,31 @@ with tab_interface:
             if submitted and mode == "chat":
                 clean_text = (user_text or "").strip()
                 if clean_text:
-                    proxy = CFG["mcp"]["proxy"]
-                    used_proxy = False
-
-                    # --- Shortcuts : /web, /ddg, /fetch, !tool
-                    if proxy.get("enabled") and proxy.get("chat_shortcuts", True):
-                        m_ddg = re.match(r"^/(?:web|ddg)\s+(.+)$", clean_text, flags=re.IGNORECASE)
-                        m_fetch = re.match(r"^/fetch\s+(\S+)$", clean_text, flags=re.IGNORECASE)
-                        m_tool = re.match(r"^!tool\s+([A-Za-z0-9_.:\-]+)\s*(.*)$", clean_text)
-
-                        if m_ddg:
-                            query = m_ddg.group(1).strip()
-                            msgs.append({"role": "user", "content": clean_text})
-                            out = ddg_search(query, topk=int(proxy.get("auto_web_topk", 5)))
-                            ctx = f"[WEB/DDG] Résultats pour: {query}\n{out}\n\n"
-                            msgs.append({"role": "assistant", "content": ctx})
-                            msgs.append({"role": "user", "content": "Sur la base du contexte web ci-dessus, réponds de façon concise."})
-                            reply = ollama_reply(CFG, msgs) or "(réponse vide)"
-                            msgs.append({"role": "assistant", "content": reply})
-                            used_proxy = True
-
-                        elif m_fetch:
-                            url = m_fetch.group(1).strip()
-                            msgs.append({"role": "user", "content": clean_text})
-                            out = ddg_fetch(url)
-                            msgs.append({"role": "assistant", "content": out})
-                            used_proxy = True
-
-                        elif m_tool:
-                            tool_name = m_tool.group(1)
-                            arg_str = (m_tool.group(2) or "").strip()
-                            try:
-                                if arg_str.startswith("{"):
-                                    args = json.loads(arg_str)
-                                else:
-                                    args = {}
-                                    for kv in shlex.split(arg_str):
-                                        if "=" in kv:
-                                            k, v = kv.split("=", 1)
-                                            args[k] = v
-                            except Exception as e:
+                    used_gateway = False
+                    # --- Raccourci: /tool <nom> {json}
+                    m_tool = re.match(r"^/tool\s+([A-Za-z0-9_.:\-]+)\s*(.*)$", clean_text)
+                    if m_tool and CFG["mcp"]["gateway"].get("enabled", True):
+                        tool_name = m_tool.group(1)
+                        arg_str = (m_tool.group(2) or "").strip()
+                        try:
+                            if arg_str.startswith("{"):
+                                args = json.loads(arg_str)
+                            else:
                                 args = {}
-                                msgs.append({"role": "assistant", "content": f"[MCP] Args invalides: {e}"})
-                            msgs.append({"role": "user", "content": clean_text})
-                            out = mcp_call_tool_via_stdio(
-                                proxy.get("command",""),
-                                proxy.get("args") or [],
-                                proxy.get("env") or {},
-                                tool_name,
-                                args,
-                                timeout_s=int(proxy.get("tool_timeout_s", 60)),
-                            )
-                            msgs.append({"role": "assistant", "content": out})
-                            used_proxy = True
-
-                    # --- Auto-web (facultatif) : prepend contexte DDG avant Ollama
-                    if proxy.get("enabled") and proxy.get("auto_web", False) and not used_proxy:
+                                for kv in shlex.split(arg_str):
+                                    if "=" in kv:
+                                        k, v = kv.split("=", 1)
+                                        args[k] = v
+                        except Exception as e:
+                            args = {}
+                            msgs.append({"role": "assistant", "content": f"[MCP] Args invalides: {e}"})
                         msgs.append({"role": "user", "content": clean_text})
-                        search_out = ddg_search(clean_text, topk=int(proxy.get("auto_web_topk", 5)))
-                        ctx = f"[WEB/DDG:auto] Résultats bruts:\n{search_out}\n\n"
-                        msgs.append({"role": "assistant", "content": ctx})
-                        msgs.append({"role": "user", "content": "Utilise le contexte DDG ci-dessus pour répondre brièvement."})
-                        reply = ollama_reply(CFG, msgs) or "(réponse vide)"
-                        msgs.append({"role": "assistant", "content": reply})
-                        used_proxy = True
+                        out = mcp_call_tool_via_gateway(tool_name, args, timeout_s=60)
+                        msgs.append({"role": "assistant", "content": out or "(vide)"})
+                        used_gateway = True
 
                     # --- Sinon: LLM pur
-                    if not used_proxy:
+                    if not used_gateway:
                         msgs.append({"role": "user", "content": clean_text})
                         reply = ollama_reply(CFG, msgs) or "Réponse vide d'Ollama (vérifie le modèle)."
                         msgs.append({"role": "assistant", "content": reply})
@@ -1667,7 +1287,6 @@ with tab_settings:
 
     with t2:
         st.write("**Sélection de la voix Piper**")
-        # simplification + suppression du bug de tuple
         CFG["piper"]["base_dir"] = st.text_input(
             "Dossier des voix (local serveur)",
             value=str(CFG["piper"].get("base_dir", "")),
@@ -1755,255 +1374,43 @@ with tab_settings:
                     st.success("Chargé") if ok else st.error("Échec warm-up")
 
     with t4:
-        st.write("**MCP Jungle (catalogue)**")
-        jungle_cfg = CFG.setdefault("mcp", {}).setdefault("jungle", {})
-        jungle_cfg["enabled"] = st.toggle("Activer MCPJungle", value=bool(jungle_cfg.get("enabled", True)))
-        jungle_cfg["repo_path"] = st.text_input(
-            "Chemin du dépôt MCPJungle",
-            value=jungle_cfg.get("repo_path", ""),
-            placeholder="~/dev/MCPJungle"
-        )
-        col_j1, col_j2 = st.columns([1, 3])
-        with col_j1:
-            if st.button("🔄 Recharger le catalogue", key="mcpjungle_reload"):
-                load_mcpjungle_catalog.clear()
-                jungle_cfg["last_scan"] = time.time()
-                st.rerun()
-        with col_j2:
-            st.caption("Le dépôt MCPJungle contient des définitions de serveurs MCP prêtes à l'emploi.")
-
-        jungle_entries: List[Dict[str, Any]] = []
-        jungle_warnings: List[str] = []
-        repo_path = jungle_cfg.get("repo_path", "").strip()
-        if jungle_cfg.get("enabled") and repo_path:
-            jungle_entries, jungle_warnings = load_mcpjungle_catalog(repo_path)
-            if jungle_entries:
-                jungle_cfg["last_scan"] = time.time()
-        elif not repo_path:
-            jungle_warnings.append("Renseigne le chemin du dépôt MCPJungle pour charger le catalogue.")
-
-        for warn in jungle_warnings:
-            st.warning(warn)
-
-        if jungle_cfg.get("enabled") and jungle_entries:
-            st.caption(f"{len(jungle_entries)} serveur(s) détecté(s) dans MCPJungle.")
-            jungle_selected = jungle_cfg.setdefault("selected", [])
-            servers = CFG.setdefault("mcp", {}).setdefault("servers", [])
-            for entry in jungle_entries:
-                container = st.container()
-                with container:
-                    header = f"**{entry.get('name', entry.get('id'))}** · `{entry.get('id')}`"
-                    st.markdown(header)
-                    if entry.get("description"):
-                        st.write(entry.get("description"))
-                    tags = entry.get("tags") or []
-                    info_bits = []
-                    if tags:
-                        info_bits.append("Tags: " + ", ".join(tags))
-                    if entry.get("homepage"):
-                        info_bits.append(f"Lien: {entry.get('homepage')}")
-                    if info_bits:
-                        st.caption(" · ".join(info_bits))
-                    cmd_preview = " ".join([entry.get("command", "")] + entry.get("args", []))
-                    st.code(cmd_preview or "(commande vide)", language="bash")
-                    if entry.get("env"):
-                        env_lines = [f"{k}={v}" for k, v in entry["env"].items()]
-                        st.caption("ENV: " + ", ".join(env_lines))
-                    already = next((s for s in servers if s.get("source") == entry.get("source")), None)
-                    col_a, col_b = st.columns([1, 1])
-                    if already:
-                        with col_a:
-                            if st.button("Mettre à jour", key=f"mcpjungle_sync_{entry['id']}"):
-                                import_mcpjungle_server(entry, CFG)
-                                if entry.get("source") and entry.get("source") not in jungle_selected:
-                                    jungle_selected.append(entry.get("source"))
-                                st.success("Serveur synchronisé depuis MCPJungle.")
-                                st.rerun()
-                        with col_b:
-                            st.caption("Déjà importé dans la configuration.")
-                    else:
-                        with col_a:
-                            if st.button("Importer", key=f"mcpjungle_add_{entry['id']}"):
-                                import_mcpjungle_server(entry, CFG)
-                                if entry.get("source") and entry.get("source") not in jungle_selected:
-                                    jungle_selected.append(entry.get("source"))
-                                st.success("Serveur ajouté depuis MCPJungle.")
-                                st.rerun()
-                        with col_b:
-                            st.caption(entry.get("origin_file", ""))
-            st.markdown("---")
-
-        st.write("**Serveurs MCP (legacy)**")
-        servers = CFG.setdefault("mcp", {}).setdefault("servers", [])
-        add_col, _ = st.columns([1, 4])
-        with add_col:
-            if st.button("➕ Ajouter un serveur MCP", key="mcp_add_server"):
-                servers.append(
-                    {
-                        "id": uuid.uuid4().hex[:8],
-                        "name": "Nouveau serveur",
-                        "command": "",
-                        "args": [],
-                        "env": {},
-                        "enabled": True,
-                        "auto_start": True,
-                    }
-                )
-                st.rerun()
-
+        st.write("**MCP (via MCPJungle Gateway)**")
         mcp_installed = _mcp_import_ok()
         if not mcp_installed:
             st.info("Installe le SDK MCP: `pip install mcp` (ou `pip install modelcontextprotocol`).")
 
-        remove_index: Optional[int] = None
-        if not servers:
-            st.caption("Aucun serveur MCP configuré pour le moment.")
-        for idx, server in enumerate(list(servers)):
-            server_id = server.get("id") or uuid.uuid4().hex[:8]
-            server["id"] = server_id
-            exp = st.expander(f"{server.get('name', 'Serveur MCP')} · {server_id}", expanded=False)
-            with exp:
-                server["enabled"] = st.toggle(
-                    "Activer ce serveur", value=bool(server.get("enabled", True)), key=f"mcp_enabled_{server_id}"
-                )
-                server["auto_start"] = st.toggle(
-                    "Démarrage automatique", value=bool(server.get("auto_start", True)), key=f"mcp_autostart_{server_id}"
-                )
-                server["name"] = st.text_input("Nom dans l'interface", value=server.get("name", "Serveur MCP"), key=f"mcp_name_{server_id}")
-                cols = st.columns([2, 3])
-                with cols[0]:
-                    server["command"] = st.text_input("Commande", value=server.get("command", ""), key=f"mcp_command_{server_id}")
-                with cols[1]:
-                    args_text = st.text_input("Arguments", value=" ".join(server.get("args", [])), key=f"mcp_args_{server_id}")
-                    if args_text.strip():
-                        try:
-                            server["args"] = shlex.split(args_text)
-                        except Exception:
-                            server["args"] = args_text.split()
-                    else:
-                        server["args"] = []
-                env_lines = []
-                env_dict = server.get("env", {}) or {}
-                for k, v in env_dict.items():
-                    env_lines.append(f"{k}={v}")
-                env_text = st.text_area("Variables d'environnement (clé=valeur, une par ligne)", value="\n".join(env_lines), key=f"mcp_env_{server_id}", height=100)
-                env: Dict[str, str] = {}
-                for line in env_text.splitlines():
-                    if not line.strip() or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-                server["env"] = env
+        CFG["mcp"]["gateway"]["enabled"] = st.toggle(
+            "Activer MCPJungle",
+            value=bool(CFG["mcp"]["gateway"].get("enabled", True))
+        )
+        CFG["mcp"]["gateway"]["base_url"]  = st.text_input(
+            "Gateway URL", value=CFG["mcp"]["gateway"].get("base_url","http://127.0.0.1:8080")
+        )
+        CFG["mcp"]["gateway"]["auth_header"] = st.text_input(
+            "Authorization (optionnel)", value=CFG["mcp"]["gateway"].get("auth_header",""), placeholder="Bearer xxx"
+        )
 
-                cmd_preview = " ".join([server.get("command", "").strip()] + [a for a in server.get("args", []) if a]).strip()
-                st.caption(f"Commande effective : `{cmd_preview}`")
-
-                sid = server["id"]
-                colx1, colx2, colx3 = st.columns([1, 1, 2])
-                with colx1:
-                    if st.button("▶️ Démarrer", key=f"mcp_start_{sid}"):
-                        _apply_env_from_cfg(CFG)
-                        _spawn_mcp_server(server)
-                with colx2:
-                    if st.button("⏹️ Stop", key=f"mcp_stop_{sid}"):
-                        _stop_mcp_server(sid)
-                with colx3:
-                    running = _mcp_running(sid)
-                    st.caption(("🟢 en cours" if running else "🔴 arrêté") + f" · log: {os.path.join('~/.jarvis/mcp-logs', sid + '.log')}")
-
-                if st.button("🔍 Lister tools (spawn éphémère)", key=f"mcp_probe_{sid}"):
-                    tools = _probe_mcp_tools(server)
-                    if tools is not None:
-                        st.success(", ".join(tools) or "(aucun)")
-
-                if st.button("🗑️ Supprimer ce serveur", key=f"mcp_delete_{server_id}"):
-                    remove_index = idx
-
-        if remove_index is not None:
-            try:
-                del servers[remove_index]
-            except Exception:
-                pass
-            st.rerun()
-
-        st.markdown("---")
-        # ---------- Proxy (Client MCP stdio) ----------
-        st.write("**Proxy MCP (adamwattis) — Client stdio éphémère**")
-        proxy = CFG["mcp"]["proxy"]
-        cols = st.columns([2,3])
-        with cols[0]:
-            proxy["enabled"] = st.toggle("Activer le client proxy", value=bool(proxy.get("enabled", False)))
-        with cols[1]:
-            proxy["command"] = st.text_input("Commande proxy (build/index.js ABSOLU)", value=proxy.get("command",""))
-        proxy_args_text = st.text_input("Arguments proxy", value=" ".join(proxy.get("args",[]) or []))
-        if proxy_args_text.strip():
-            try:
-                proxy["args"] = shlex.split(proxy_args_text)
-            except Exception:
-                proxy["args"] = proxy_args_text.split()
-        else:
-            proxy["args"] = []
-        env_lines = [f"{k}={v}" for k, v in (proxy.get("env") or {}).items()]
-        env_text = st.text_area("ENV (inclure MCP_CONFIG_PATH=/ABSOLU/adamwattis_mcp-proxy-server/config.json)", value="\n".join(env_lines), height=80)
-        new_env: Dict[str,str] = {}
-        for line in env_text.splitlines():
-            if not line.strip() or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            new_env[k.strip()] = v.strip()
-        proxy["env"] = new_env
-        proxy["tool_timeout_s"] = st.number_input("Timeout tool (s)", min_value=5, max_value=600, value=int(proxy.get("tool_timeout_s",60)), step=5)
-
-        st.markdown("—")
-        cc1, cc2, cc3 = st.columns(3)
-        with cc1:
-            proxy["chat_shortcuts"] = st.toggle("Raccourcis chat (/web, /fetch)", value=bool(proxy.get("chat_shortcuts", True)))
-        with cc2:
-            proxy["auto_web"] = st.toggle("Auto-web (DDG avant LLM)", value=bool(proxy.get("auto_web", False)))
-        with cc3:
-            proxy["auto_web_topk"] = st.number_input(
-                "Top-K DDG",
-                min_value=1, max_value=20,
-                value=int(proxy.get("auto_web_topk",5)), step=1,
-                key="topk_ddg_settings"
-            )
-
-        colp1, colp2 = st.columns(2)
-        with colp1:
-            if st.button("🔍 Lister tools (via proxy)"):
-                if not _mcp_import_ok():
-                    st.error("Installe le SDK MCP: `pip install mcp`.")
-                else:
-                    try:
-                        tools = mcp_list_tools_via_stdio(proxy.get("command",""), proxy.get("args") or [], proxy.get("env") or {})
-                        st.success(", ".join(tools) or "(aucun)")
-                    except Exception as e:
-                        st.error(f"Echec list_tools: {e}")
-        with colp2:
-            with st.popover("▶️ Appeler un tool (proxy)"):
-                tname = st.text_input("Nom du tool", placeholder="ex: search")
-                targ  = st.text_area("Arguments (JSON)", placeholder='{"query":"hello"}', height=120)
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("🔍 Lister tools (Gateway)"):
+                try:
+                    tools = mcp_list_tools_via_gateway()
+                    st.success(", ".join(tools) or "(aucun)")
+                except Exception as e:
+                    st.error(f"list_tools: {e}")
+        with colB:
+            with st.popover("▶️ Appeler un tool (Gateway)"):
+                tname = st.text_input("Nom du tool", placeholder="ex: time__get_current_time")
+                targ  = st.text_area("Arguments (JSON)", placeholder='{"foo":"bar"}', height=120)
                 if st.button("Exécuter"):
                     try:
                         args = json.loads(targ) if targ.strip() else {}
+                        out = mcp_call_tool_via_gateway(tname.strip(), args, timeout_s=60)
+                        st.code(out or "(vide)")
                     except Exception as e:
-                        st.error(f"JSON invalide: {e}")
-                        args = None
-                    if args is not None:
-                        try:
-                            out = mcp_call_tool_via_stdio(
-                                proxy.get("command",""),
-                                proxy.get("args") or [],
-                                proxy.get("env") or {},
-                                tname.strip(),
-                                args,
-                                timeout_s=int(proxy.get("tool_timeout_s",60)),
-                            )
-                            st.code(out or "(vide)", language="markdown")
-                        except Exception as e:
-                            st.error(f"Echec call_tool: {e}")
+                        st.error(f"call_tool: {e}")
 
-        st.caption("Raccourcis chat:  `/web requête`  ·  `/ddg requête`  ·  `/fetch URL`  ·  `!tool <nom> {json}`")
+        st.caption("Raccourci chat:  `/tool <nom> {json}`  — se connecte au gateway MCPJungle.")
 
     with t5:
         csa, csb = st.columns(2)
