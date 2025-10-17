@@ -66,6 +66,18 @@ FW_BEAM_CMD   = int(os.getenv("FW_BEAM_CMD",  "1"))
 FW_VAD_CMD    = int(os.getenv("FW_VAD_CMD",   "0"))   # 0 = OFF (on coupe au silence micro)
 FW_VAD_WAKE   = int(os.getenv("FW_VAD_WAKE",  "1"))
 
+# Helpers bool env
+def _env_flag(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    val = str(val).strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return default
+
 # Capture audio à faible latence (fin de phrase)
 REC_MAX_S       = float(os.getenv("REC_MAX_S", "6.0"))
 REC_CHUNK_S     = float(os.getenv("REC_CHUNK_S", "0.2"))
@@ -88,6 +100,14 @@ OLLAMA_STREAM = int(os.getenv("OLLAMA_STREAM", "1"))
 
 # MCP configuration (JSON depuis l'UI Streamlit)
 MCP_SERVERS_JSON = os.getenv("MCP_SERVERS_JSON", "[]")
+MCP_GATEWAY_ENABLED = _env_flag("MCP_GATEWAY_ENABLED", False)
+MCP_GATEWAY_BASE_URL = os.getenv("MCP_GATEWAY_BASE_URL", "").strip()
+MCP_GATEWAY_AUTH_HEADER = os.getenv("MCP_GATEWAY_AUTH_HEADER", "").strip()
+MCP_GATEWAY_AUTO_WEB = _env_flag("MCP_GATEWAY_AUTO_WEB", False)
+try:
+    MCP_GATEWAY_AUTO_WEB_TOPK = int(os.getenv("MCP_GATEWAY_AUTO_WEB_TOPK", "5"))
+except ValueError:
+    MCP_GATEWAY_AUTO_WEB_TOPK = 5
 
 # Wake config
 REQUIRE_WAKE     = int(os.getenv("REQUIRE_WAKE", "1"))
@@ -441,6 +461,81 @@ def load_mcp_configs() -> List[MCPServerConfig]:
 
 
 MCP_MANAGER: Optional[MCPToolManager] = None
+
+
+def _gateway_available() -> bool:
+    return MCP_GATEWAY_ENABLED and bool(MCP_GATEWAY_BASE_URL)
+
+
+def _gateway_headers() -> Dict[str, str]:
+    if not MCP_GATEWAY_AUTH_HEADER:
+        return {}
+    return {"Authorization": MCP_GATEWAY_AUTH_HEADER}
+
+
+def _call_tool_via_gateway(tool: str, arguments: Dict[str, Any], timeout_s: int = 60) -> str:
+    if not _gateway_available():
+        raise RuntimeError("Gateway MCP désactivé.")
+    base = MCP_GATEWAY_BASE_URL.rstrip("/")
+    headers = _gateway_headers()
+    primary_exc: Optional[Exception] = None
+    try:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        async def _go():
+            async with streamablehttp_client(f"{base}/mcp", headers=headers) as (r, w, _):
+                async with ClientSession(r, w) as sess:
+                    await sess.initialize()
+                    try:
+                        res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
+                    except asyncio.TimeoutError:
+                        return "[MCP] Timeout d'exécution du tool."
+                    return _render_tool_result(res) or ""
+
+        return asyncio.run(_go())
+    except Exception as exc:
+        primary_exc = exc
+
+    try:
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+
+        async def _go_sse():
+            async with sse_client(f"{base}/sse", headers=headers) as (r, w):
+                async with ClientSession(r, w) as sess:
+                    await sess.initialize()
+                    try:
+                        res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
+                    except asyncio.TimeoutError:
+                        return "[MCP] Timeout d'exécution du tool."
+                    return _render_tool_result(res) or ""
+
+        return asyncio.run(_go_sse())
+    except Exception as exc:
+        if primary_exc is not None:
+            raise primary_exc
+        raise exc
+
+
+def ddg_search_gateway(query: str, topk: int = 5) -> str:
+    try:
+        args = {"query": query, "max_results": int(topk)}
+    except Exception:
+        args = {"query": query, "max_results": 5}
+    try:
+        return _call_tool_via_gateway("ddg__search", args, timeout_s=60)
+    except Exception as exc:
+        log(f"[WEB] Erreur ddg__search: {exc}")
+        return ""
+
+
+def ddg_fetch_gateway(url: str) -> str:
+    try:
+        return _call_tool_via_gateway("ddg__fetch_content", {"url": url}, timeout_s=60)
+    except Exception as exc:
+        log(f"[WEB] Erreur ddg__fetch_content: {exc}")
+        return ""
 # ===================== AUDIO (I/O + samplerate) =====================
 def pick_devices_and_rates(prefer_output_name_substr: str | None = None):
     devices = sd.query_devices()
@@ -799,11 +894,16 @@ def init_llm():
     )
     return None, None
 
-def _ollama_messages(question: str):
-    return [
+def _ollama_messages(question: str, web_context: Optional[str] = None):
+    messages = [
         {"role": "system", "content": "Tu es JARVIS, assistant direct et concis. Réponds en français."},
         {"role": "user",   "content": question},
     ]
+    ctx = (web_context or "").strip()
+    if ctx:
+        messages.append({"role": "assistant", "content": ctx})
+        messages.append({"role": "user", "content": "Utilise le contexte web ci-dessus pour répondre brièvement."})
+    return messages
 
 def _ollama_options():
     return {
@@ -811,9 +911,9 @@ def _ollama_options():
         "num_ctx": int(OLLAMA_NUM_CTX),
     }
 
-def generate_full(question: str, manager: Optional[MCPToolManager] = None) -> str:
+def generate_full(question: str, manager: Optional[MCPToolManager] = None, web_context: Optional[str] = None) -> str:
     try:
-        messages = _ollama_messages(question)
+        messages = _ollama_messages(question, web_context=web_context)
         tools = manager.tools if manager and manager.has_tools() else None
         while True:
             kwargs = {
@@ -842,14 +942,14 @@ def generate_full(question: str, manager: Optional[MCPToolManager] = None) -> st
         log(f"[LLM] Erreur Ollama: {e}")
         return ""
 
-def generate_stream(question: str, manager: Optional[MCPToolManager] = None):
+def generate_stream(question: str, manager: Optional[MCPToolManager] = None, web_context: Optional[str] = None):
     try:
         if manager and manager.has_tools():
-            yield generate_full(question, manager)
+            yield generate_full(question, manager, web_context=web_context)
             return
         for chunk in ollama_client.chat(
             model=LLM_ID,
-            messages=_ollama_messages(question),
+            messages=_ollama_messages(question, web_context=web_context),
             stream=True,
             options=_ollama_options(),
         ):
@@ -912,18 +1012,33 @@ def handle_command(stt_model: WhisperModel, tts, tok, mdl):
         if "arrête-toi" in user_text or "éteins-toi" in user_text:
             tts.speak("D'accord, je me mets en veille."); stop_main.set(); return
 
+        web_context = None
+        if (
+            _gateway_available()
+            and MCP_GATEWAY_AUTO_WEB
+            and MCP_GATEWAY_AUTO_WEB_TOPK > 0
+            and user_text
+        ):
+            search_out = ddg_search_gateway(
+                user_text,
+                topk=max(1, MCP_GATEWAY_AUTO_WEB_TOPK),
+            ).strip()
+            if search_out:
+                web_context = f"[WEB/DDG:auto] Résultats bruts:\n{search_out}\n\n"
+                log(f"JARVIS: {web_context.strip()}")
+
         manager = MCP_MANAGER
         has_tools = bool(manager and manager.has_tools())
         use_stream = bool(OLLAMA_STREAM) and not tts.clone_once and not has_tools
         if not use_stream:
-            full = generate_full(user_text, manager=manager).strip()
+            full = generate_full(user_text, manager=manager, web_context=web_context).strip()
             if not full:
                 tts.speak("Désolé, je n'ai rien reçu du modèle."); return
             tts.speak(full)
         else:
             buffer = ""
             first_spoken = False
-            for tok_txt in generate_stream(user_text, manager=manager):
+            for tok_txt in generate_stream(user_text, manager=manager, web_context=web_context):
                 if not tok_txt:
                     continue
                 buffer += tok_txt
