@@ -678,8 +678,8 @@ if "assistant_vu_history" not in st.session_state:
     st.session_state.assistant_vu_history = []
 if "mode_toggle" not in st.session_state:
     st.session_state.mode_toggle = False
-if "auto_refresh_chat" not in st.session_state:
-    st.session_state.auto_refresh_chat = False  # désactivé par défaut
+if "last_log_ts" not in st.session_state:
+    st.session_state.last_log_ts = 0.0
 
 def _set_interaction_mode(mode: str):
     """Définit le mode d'interaction (vocal ou chat)."""
@@ -930,8 +930,45 @@ def _ingest_chat_from_logs(logs: List[str]):
         st.rerun()
 
 if new_logs:
+    st.session_state.last_log_ts = time.time()
     _update_speaking_state_from_logs(new_logs)
     _ingest_chat_from_logs(new_logs)
+
+
+def _schedule_vocal_refresh(interval_ms: int = 650):
+    """Planifie un rafraîchissement automatique lorsque la voix est active."""
+    if st.session_state.get("interaction_mode") != "vocal":
+        return
+
+    now = time.time()
+    jarvis_running = bool(st.session_state.get("jarvis_running", False))
+    speaking = bool(st.session_state.get("assistant_speaking", False))
+    last_assistant_ts = float(st.session_state.get("last_assistant_ts", 0.0))
+    last_log_ts = float(st.session_state.get("last_log_ts", 0.0))
+
+    recently_spoke = (now - last_assistant_ts) < 3.0
+    recent_logs = (now - last_log_ts) < 3.0
+
+    if not jarvis_running or not (speaking or recent_logs or recently_spoke):
+        return
+
+    components.html(
+        f"""
+        <script>
+            (function() {{
+                const target = window.parent || window;
+                if (!target || !target.postMessage) {{
+                    return;
+                }}
+                const rerun = () => target.postMessage({{ type: 'streamlit:rerunScript' }}, '*');
+                window.setTimeout(rerun, {interval_ms});
+            }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+        scrolling=False,
+    )
 
 # -------------- ORT providers (affichage dans topbar) --------------
 def _ort_providers() -> Tuple[List[str], str]:
@@ -1369,6 +1406,8 @@ with tab_interface:
                 bubbles.append(f'<div class="{cls}">{safe_content}</div>')
             return f"<div class='msgs'>{''.join(bubbles)}</div>"
 
+        _schedule_vocal_refresh()
+
         chat_slot = st.empty()
         chat_slot.markdown(
             f'''
@@ -1406,13 +1445,6 @@ with tab_interface:
             )
             st.caption("Raccourci chat: `/tool <nom> {json}`  → appelle le tool via le gateway.")
 
-            st.divider()
-            st.write("🔄 **Rafraîchissement**")
-            st.session_state.auto_refresh_chat = st.toggle(
-                "Auto-refresh pendant la parole",
-                value=bool(st.session_state.get("auto_refresh_chat", False)),
-                help="Évite que les boutons deviennent difficilement cliquables."
-            )
             st.markdown('</div>', unsafe_allow_html=True)
 
         mode = st.session_state.interaction_mode
@@ -1742,11 +1774,10 @@ with tab_settings:
                 st.cache_data.clear()
                 st.rerun()
 
-# --- Auto-refresh quand Jarvis tourne en mode vocal (désactivable) ---
+# --- Auto-refresh quand Jarvis tourne en mode vocal ---
 if (
     st.session_state.get("jarvis_running")
     and st.session_state.get("interaction_mode") == "vocal"
-    and st.session_state.get("auto_refresh_chat", False)
     and (time.time() - st.session_state.get("last_assistant_ts", 0.0)) < 10
 ):
     time.sleep(0.3)
