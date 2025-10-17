@@ -152,6 +152,8 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
     jarvis_cfg = cfg.get("jarvis", {})
     piper_cfg = cfg.get("piper", {})
     ollama_cfg = cfg.get("ollama", {})
+    gateway_cfg = (cfg.get("mcp", {}).get("gateway") or {})
+
     env_map = {
         "FW_MODEL": whisper.get("model"),
         "FW_DEVICE": whisper.get("device"),
@@ -181,6 +183,12 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
         "OLLAMA_NUM_CTX": str(ollama_cfg.get("num_ctx", 4096)),
         "OLLAMA_STREAM": "1" if ollama_cfg.get("stream") else "0",
         "MCP_SERVERS_JSON": "[]",  # Legacy compat
+        "MCP_GATEWAY_ENABLED": "1" if gateway_cfg.get("enabled", True) else "0",
+        "MCP_GATEWAY_BASE_URL": gateway_cfg.get("base_url"),
+        "MCP_GATEWAY_AUTH_HEADER": gateway_cfg.get("auth_header"),
+        "MCP_GATEWAY_AUTO_WEB": "1" if gateway_cfg.get("auto_web", False) else "0",
+        "MCP_GATEWAY_AUTO_WEB_TOPK": str(gateway_cfg.get("auto_web_topk", 5)),
+        "MCP_GATEWAY_CHAT_SHORTCUTS": "1" if gateway_cfg.get("chat_shortcuts", True) else "0",
     }
     for key, value in env_map.items():
         if value is None:
@@ -909,10 +917,6 @@ def _ingest_chat_from_logs(logs: List[str]):
             if content:
                 msgs.append({"role": "user", "content": content})
                 changed = True
-                try:
-                    process_user_text(content, origin="voice")
-                except Exception as e:
-                    msgs.append({"role":"assistant","content": f"[VOIX] erreur: {e}"})
             continue
         m_ass = re.match(r'^(?:JARVIS|Assistant)\s*:\s*(.+)$', line, flags=re.IGNORECASE)
         if m_ass:

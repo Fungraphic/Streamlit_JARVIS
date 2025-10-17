@@ -166,6 +166,18 @@ Les issues et PR sont les bienvenues. Pensez à préciser : OS, version de Pytho
 
 ---
 
+## ✅ Tests rapides
+
+Un script minimal est fourni pour vérifier que les modules principaux se compilent correctement :
+
+```bash
+scripts/run_tests.sh
+```
+
+Le script exécute `python -m py_compile app.py jarvis.py` depuis la racine du dépôt et échoue immédiatement si la compilation détecte une erreur de syntaxe.
+
+---
+
 ## 📝 Licence
 
 Projet distribué sous licence MIT (`LICENSE`).
