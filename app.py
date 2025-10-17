@@ -290,6 +290,39 @@ def ollama_reply(cfg, messages) -> str:
         except Exception as e2:
             return f"Erreur Ollama: {e2}"
 
+# --- Streaming Ollama (tokens en direct) ---
+def ollama_stream_chat(cfg: Dict[str, Any], messages: List[Dict[str, Any]], on_delta):
+    """Stream /api/chat en direct (sans tools). Appelle on_delta(text_chunk) à chaque token/delta."""
+    host = cfg["ollama"]["host"].rstrip("/")
+    model = cfg["ollama"]["model"]
+    options = {
+        "temperature": float(cfg["ollama"].get("temperature", 0.7)),
+        "num_ctx": int(cfg["ollama"].get("num_ctx", 4096)),
+    }
+    url = f"{host}/api/chat"
+    payload = {
+        "model": model,
+        "messages": _build_ollama_chat_messages(messages),
+        "stream": True,
+        "options": options,
+    }
+    with requests.post(url, json=payload, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        buf = []
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            # Ollama envoie {message:{content:"..."}, done:bool, ...}
+            chunk = (((obj.get("message") or {}).get("content")) or "")
+            if chunk:
+                buf.append(chunk)
+                on_delta(chunk)
+        return "".join(buf)
+
 def start_ollama_daemon(log_path: Optional[str] = None) -> bool:
     """Lance le daemon Ollama."""
     try:
@@ -492,7 +525,7 @@ _TOOL_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*([\s\S]*?)\s*```$", re.IGNORE
 _BRACED_JSON_RE = re.compile(r"\{[\s\S]*\}")
 
 def _extract_tool_json(text: str) -> Optional[Dict[str, Any]]:
-    """Extrait {"tool": "...", "args": {...}} depuis 'text' si présent."""
+    """Extrait {\"tool\": \"...\", \"args\": {...}} depuis 'text' si présent."""
     if not text:
         return None
     candidate = None
@@ -546,7 +579,7 @@ def maybe_run_tool_and_answer(cfg: Dict[str, Any], msgs: List[Dict[str, str]], l
         return current_reply or ""
     return None
 
-# ---------- NOUVEAU : Tool-calling natif Ollama (boucle d'agent) ----------
+# ---------- NOUVEAU : Tool-calling natif Ollama (boucle d’agent) ----------
 def build_ollama_tools_from_mcp() -> List[Dict[str, Any]]:
     """
     Transforme les tools MCP (name/description/inputSchema) en liste Ollama 'tools'.
@@ -612,7 +645,7 @@ def chat_with_tools_agent(cfg: Dict[str, Any], user_text: str, ui_msgs: List[Dic
             "tools": tools,
             "stream": False,
             "options": options,
-            # "think": False,  # activer si vous utilisez des modèles "thinking"
+            # "think": False,
         }
         try:
             r = requests.post(url, json=payload, timeout=180)
@@ -678,8 +711,7 @@ if "assistant_vu_history" not in st.session_state:
     st.session_state.assistant_vu_history = []
 if "mode_toggle" not in st.session_state:
     st.session_state.mode_toggle = False
-if "auto_refresh_chat" not in st.session_state:
-    st.session_state.auto_refresh_chat = False  # désactivé par défaut
+# (SUPPRIMÉ) auto_refresh_chat: plus utilisé
 
 def _set_interaction_mode(mode: str):
     """Définit le mode d'interaction (vocal ou chat)."""
@@ -812,6 +844,73 @@ def _update_speaking_state_from_logs(logs: List[str]):
     st.session_state.last_assistant_ts = last_ts
     st.session_state.assistant_speaking = speaking
 
+# ---------- Ingestion chat : NOUVELLE VERSION ----------
+# Préfixes reconnus
+CHAT_PREFIX_USER = re.compile(r'^\[(?:STT|VOICE)\]\s*(?:Vous|You)\s*:\s*(.+)$', re.IGNORECASE)
+CHAT_PREFIX_ASSISTANT = re.compile(r'^(?:JARVIS|Assistant)\s*:\s*(.+)$', re.IGNORECASE)
+# Tout log technique qui commence par [TAG] (ferme l’agrégation assistant)
+NON_CHAT_PREFIX = re.compile(r'^\[(?:VU|AUDIO|TTS|LLM|BG|INFO|WARN|ERR|DEBUG|MCP)\]', re.IGNORECASE)
+
+def _append_assistant_line(messages: List[Dict[str, str]], text: str) -> None:
+    """Concatène 'text' à la dernière bulle assistant, ou crée une nouvelle bulle."""
+    text = "" if text is None else str(text)
+    if messages and messages[-1].get("role") == "assistant":
+        prev = messages[-1]["content"]
+        sep = "\n" if (prev and text and not prev.endswith("\n")) else ""
+        messages[-1]["content"] = (prev + sep + text).rstrip()
+    else:
+        messages.append({"role": "assistant", "content": text.rstrip()})
+
+def _ingest_chat_from_logs(logs: List[str], *, rerun: bool = True):
+    """
+    Ingère les messages chat depuis les logs + agrège toutes les lignes après 'JARVIS:'.
+    Ferme l'agrégation si un nouveau préfixe de log [TAG] apparaît ou si un message user arrive.
+    """
+    if not logs:
+        return
+    msgs = st.session_state.setdefault("messages", [])
+    assembling = bool(st.session_state.get("_assembling_assistant", False))
+    changed = False
+
+    for raw in logs:
+        line = (raw or "").rstrip("\n")
+        if line == "":
+            if assembling:
+                _append_assistant_line(msgs, "")
+                changed = True
+            continue
+
+        m_user = CHAT_PREFIX_USER.match(line)
+        if m_user:
+            assembling = False
+            content = m_user.group(1).strip()
+            if content:
+                msgs.append({"role": "user", "content": content})
+                changed = True
+            continue
+
+        m_ass = CHAT_PREFIX_ASSISTANT.match(line)
+        if m_ass:
+            assembling = True
+            _append_assistant_line(msgs, m_ass.group(1).strip())
+            changed = True
+            continue
+
+        if NON_CHAT_PREFIX.match(line):
+            assembling = False
+            continue
+
+        if assembling:
+            _append_assistant_line(msgs, line)
+            changed = True
+        # sinon: bruit, on ignore
+
+    st.session_state["_assembling_assistant"] = assembling
+    if changed:
+        st.session_state["messages"] = msgs[-200:]
+        if rerun:
+            st.rerun()
+
 # ---------- Orchestration message (chat & voix) ----------
 def process_user_text(clean_text: str, origin: str = "chat"):
     """
@@ -901,37 +1000,9 @@ def process_user_text(clean_text: str, origin: str = "chat"):
     st.session_state.assistant_speaking = True
 
 new_logs = drain_jarvis_logs() if st.session_state.jarvis_running else []
-def _ingest_chat_from_logs(logs: List[str]):
-    """Ingère les messages chat depuis les logs + déclenche pipeline voix."""
-    if not logs:
-        return
-    msgs = st.session_state.setdefault("messages", [])
-    changed = False
-    for raw in logs:
-        line = (raw or "").strip()
-        if not line:
-            continue
-        m_user = re.match(r'^\[(?:STT|VOICE)\]\s*(?:Vous|You)\s*:\s*(.+)$', line, flags=re.IGNORECASE)
-        if m_user:
-            content = m_user.group(1).strip()
-            if content:
-                msgs.append({"role": "user", "content": content})
-                changed = True
-            continue
-        m_ass = re.match(r'^(?:JARVIS|Assistant)\s*:\s*(.+)$', line, flags=re.IGNORECASE)
-        if m_ass:
-            content = m_ass.group(1).strip()
-            if content:
-                msgs.append({"role": "assistant", "content": content})
-                changed = True
-            continue
-    if changed:
-        st.session_state["messages"] = msgs[-200:]
-        st.rerun()
-
 if new_logs:
     _update_speaking_state_from_logs(new_logs)
-    _ingest_chat_from_logs(new_logs)
+    _ingest_chat_from_logs(new_logs, rerun=False)
 
 # -------------- ORT providers (affichage dans topbar) --------------
 def _ort_providers() -> Tuple[List[str], str]:
@@ -993,7 +1064,7 @@ body::before{
 .user{ align-self:flex-end; background: rgba(68,241,255,0.08); }
 .assistant{ align-self:flex-start; background: rgba(255,255,255,0.04); }
 .chat-toggle{ margin-top:8px; }
-.chat-toggle [data-testid="stToggle"]{ width:100%; background: var(--accent); padding:10px 12px; border-radius: 12px; border:1px solid var(--border); }
+.chat-toggle [data-testid="stToggle"]{ width:100%; background: var(--accent); padding:10px 12px; border-radius: 12px; }
 .chat-toggle [data-testid="stToggle"] label{ color: var(--fg); font-weight:600; }
 .chat-toggle [data-testid="stToggle"] [data-testid="stTickBar"]{ background: var(--primary); }
 .chat-input input{ background: var(--accent) !important; color: var(--fg) !important; border:1px solid var(--border); border-radius: 10px; padding:10px 12px; }
@@ -1406,13 +1477,8 @@ with tab_interface:
             )
             st.caption("Raccourci chat: `/tool <nom> {json}`  → appelle le tool via le gateway.")
 
-            st.divider()
-            st.write("🔄 **Rafraîchissement**")
-            st.session_state.auto_refresh_chat = st.toggle(
-                "Auto-refresh pendant la parole",
-                value=bool(st.session_state.get("auto_refresh_chat", False)),
-                help="Évite que les boutons deviennent difficilement cliquables."
-            )
+            # (SUPPRIMÉ) bloc Auto-refresh inutile
+
             st.markdown('</div>', unsafe_allow_html=True)
 
         mode = st.session_state.interaction_mode
@@ -1444,13 +1510,91 @@ with tab_interface:
             if submitted and mode == "chat":
                 clean_text = (user_text or "").strip()
                 if clean_text:
-                    process_user_text(clean_text, origin="chat")
-                    st.rerun()
+                    # Si streaming Ollama activé ET tool-calling natif désactivé, on stream la réponse.
+                    if bool(CFG["ollama"].get("stream")) and not bool(CFG["llm"].get("use_ollama_tools", True)):
+                        st.session_state["messages"].append({"role": "user", "content": clean_text})
+                        st.session_state["messages"].append({"role": "assistant", "content": ""})
+
+                        def _on_delta(tok: str):
+                            st.session_state["messages"][-1]["content"] += tok
+                            msgs_live = st.session_state["messages"][-200:]
+                            chat_slot.markdown(
+                                f'''
+                                <div class="card chat-card">
+                                  <div class="chat-card-body">
+                                    <h3>Chat</h3>
+                                    <div class="chat-wrap">
+                                      {_render_messages(msgs_live)}
+                                    </div>
+                                  </div>
+                                </div>
+                                ''',
+                                unsafe_allow_html=True
+                            )
+
+                        try:
+                            _apply_env_from_cfg(CFG)
+                            # On utilise uniquement les 20 derniers messages pour le contexte
+                            ctx_msgs = st.session_state["messages"][-20:]
+                            _ = ollama_stream_chat(CFG, ctx_msgs, _on_delta)
+                        except Exception as e:
+                            st.session_state["messages"][-1]["content"] = f"(Erreur stream Ollama: {e})"
+                    else:
+                        # Flux complet avec tools/auto-web/etc.
+                        process_user_text(clean_text, origin="chat")
+                        # Repeindre le chat sans relancer l'app
+                        msgs_now = st.session_state.get("messages", [])
+                        chat_slot.markdown(
+                            f'''
+                            <div class="card chat-card">
+                              <div class="chat-card-body">
+                                <h3>Chat</h3>
+                                <div class="chat-wrap">
+                                  {_render_messages(msgs_now)}
+                                </div>
+                              </div>
+                            </div>
+                            ''',
+                            unsafe_allow_html=True
+                        )
 
         if mode == "vocal":
             st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
 
         st.caption(f"Messages en mémoire: {len(st.session_state.get('messages', []))}")
+
+        # --- Live pump (voix & logs backend) : mise à jour temps réel SANS bouton, SANS st.rerun ---
+        if st.session_state.get("jarvis_running") and (st.session_state.get("interaction_mode") == "vocal"):
+            idle_timeout = 120.0   # [MODIF] la pompe reste active plus longtemps (2 min d’inactivité)
+            poll_interval = 0.10   # [MODIF] latence visuelle ~100 ms
+            last_activity = time.time()
+
+            while True:
+                logs = drain_jarvis_logs()
+                if logs:
+                    _update_speaking_state_from_logs(logs)
+                    _ingest_chat_from_logs(logs, rerun=False)
+                    last_activity = time.time()
+
+                    # Repeindre le chat sans relancer le script
+                    msgs_live = st.session_state.get("messages", [])
+                    chat_slot.markdown(
+                        f'''
+                        <div class="card chat-card">
+                          <div class="chat-card-body">
+                            <h3>Chat</h3>
+                            <div class="chat-wrap">
+                              {_render_messages(msgs_live)}
+                            </div>
+                          </div>
+                        </div>
+                        ''',
+                        unsafe_allow_html=True
+                    )
+
+                if time.time() - last_activity > idle_timeout:
+                    break
+                time.sleep(poll_interval)
 
 # -------------------- Settings --------------------
 with tab_settings:
@@ -1578,7 +1722,7 @@ with tab_settings:
                 if saved:
                     st.success(f"Enregistré : {saved}")
         with up2:
-            up_json = st.file_uploader("Voice JSON (optional)", type=["json"], accept_multiple_files=False, key="up_json")
+            up_json = st.file_uploader("Voice JSON (optionnel)", type=["json"], accept_multiple_files=False, key="up_json")
             if up_json:
                 saved = save_uploaded(up_json, CFG["piper"]["base_dir"])
                 if saved:
@@ -1617,7 +1761,7 @@ with tab_settings:
 
         CFG["ollama"]["temperature"] = st.slider("Température", 0.0, 1.5, float(CFG["ollama"]["temperature"]), 0.05)
         CFG["ollama"]["num_ctx"] = st.number_input("Contexte (num_ctx)", 512, 16384, int(CFG["ollama"]["num_ctx"]), 512)
-        CFG["ollama"]["stream"] = st.toggle("Streaming tokens", value=bool(CFG["ollama"]["stream"]))
+        CFG["ollama"]["stream"] = st.toggle("Streaming tokens (mode chat sans tools)", value=bool(CFG["ollama"]["stream"]))
         st.markdown("---")
         st.write("**Prompt & Agent**")
         CFG.setdefault("llm", {})
@@ -1742,12 +1886,4 @@ with tab_settings:
                 st.cache_data.clear()
                 st.rerun()
 
-# --- Auto-refresh quand Jarvis tourne en mode vocal (désactivable) ---
-if (
-    st.session_state.get("jarvis_running")
-    and st.session_state.get("interaction_mode") == "vocal"
-    and st.session_state.get("auto_refresh_chat", False)
-    and (time.time() - st.session_state.get("last_assistant_ts", 0.0)) < 10
-):
-    time.sleep(0.3)
-    st.rerun()
+# (SUPPRIMÉ) Auto-refresh forcé via st.rerun en boucle — remplacé par la pompe live ci-dessus.
