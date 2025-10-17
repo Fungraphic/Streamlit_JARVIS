@@ -2,9 +2,15 @@
 # -*- coding: utf-8 -*-
 import os, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex, asyncio, copy, math
 from typing import List, Dict, Any, Optional, Tuple, Union
+from pathlib import Path
 import streamlit as st
 import requests
 import streamlit.components.v1 as components  # <- pour l'iframe HTML du radar
+
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None  # Optionnel : utilisé pour MCPJungle
 
 st.set_page_config(page_title="Jarvis — Streamlit UI (style shadcn) v3", layout="wide")
 
@@ -48,6 +54,12 @@ DEFAULT_CFG: Dict[str, Any] = {
             "chat_shortcuts": True,
             "auto_web": False,
             "auto_web_topk": 5
+        },
+        "jungle": {
+            "enabled": True,
+            "repo_path": "",
+            "selected": [],
+            "last_scan": 0,
         },
     },
     "jarvis": {
@@ -114,6 +126,9 @@ def _normalize_mcp_servers(cfg: Dict[str, Any]) -> None:
                 server["args"] = []
         if not isinstance(server.get("env"), dict):
             server["env"] = {}
+        extras = {k: copy.deepcopy(v) for k, v in entry.items() if k not in {"id", "name", "command", "args", "env", "enabled", "auto_start"}}
+        for k, v in extras.items():
+            server[k] = v
         normalized.append(server)
     mcp["servers"] = normalized
     proxy = mcp.get("proxy", {}) or {}
@@ -126,6 +141,13 @@ def _normalize_mcp_servers(cfg: Dict[str, Any]) -> None:
         "chat_shortcuts": bool(proxy.get("chat_shortcuts", True)),
         "auto_web": bool(proxy.get("auto_web", False)),
         "auto_web_topk": int(proxy.get("auto_web_topk", 5)),
+    }
+    jungle = mcp.get("jungle", {}) or {}
+    mcp["jungle"] = {
+        "enabled": bool(jungle.get("enabled", True)),
+        "repo_path": str(jungle.get("repo_path", "")),
+        "selected": list(jungle.get("selected", []) or []),
+        "last_scan": float(jungle.get("last_scan", 0.0)),
     }
 
 def load_cfg() -> Dict[str, Any]:
@@ -401,6 +423,190 @@ def _merge_env(env: Optional[Dict[str,str]]) -> Dict[str,str]:
     for k, v in (env or {}).items():
         merged[str(k)] = str(v)
     return merged
+
+_MCPJ_SKIP_DIRS = {".git", "node_modules", "__pycache__", "build", "dist", ".venv", ".mypy_cache"}
+
+def _safe_mcp_id(raw: Optional[str], fallback: str) -> str:
+    base = (raw or "").strip() or fallback
+    base = re.sub(r"[^a-zA-Z0-9_.-]+", "-", base)
+    base = base.strip("-_") or fallback
+    return base[:60]
+
+def _listify_args(args: Union[str, List[Any], None]) -> List[str]:
+    if args is None:
+        return []
+    if isinstance(args, list):
+        return [str(a) for a in args if a not in (None, "")]
+    if isinstance(args, str):
+        try:
+            return [a for a in shlex.split(args) if a]
+        except Exception:
+            return [a for a in args.split() if a]
+    return []
+
+def _dictify_env(env: Any) -> Dict[str, str]:
+    if not isinstance(env, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in env.items():
+        if k:
+            out[str(k)] = "" if v is None else str(v)
+    return out
+
+def _extract_jungle_entries(payload: Any, source: str, results: Dict[str, Dict[str, Any]]):
+    if payload is None:
+        return
+    if isinstance(payload, list):
+        for item in payload:
+            _extract_jungle_entries(item, source, results)
+        return
+    if not isinstance(payload, dict):
+        return
+
+    command = payload.get("command")
+    args = payload.get("args")
+    env = payload.get("env")
+    runner = payload.get("runner") or payload.get("run") or payload.get("start")
+    if isinstance(runner, dict):
+        command = command or runner.get("command") or runner.get("cmd") or runner.get("binary")
+        if not args:
+            args = runner.get("args") or runner.get("argv") or runner.get("arguments")
+        if not env:
+            env = runner.get("env")
+
+    command = (command or "").strip()
+    cmd_args = _listify_args(args)
+    env_dict = _dictify_env(env)
+
+    candidate_id = payload.get("id") or payload.get("slug") or payload.get("name")
+    rel_source = source
+    server_id = _safe_mcp_id(str(candidate_id) if candidate_id else None, Path(source).stem)
+
+    description = payload.get("description") or payload.get("summary") or payload.get("about") or ""
+    tags = []
+    if isinstance(payload.get("tags"), list):
+        tags = [str(t) for t in payload.get("tags") if t]
+    elif isinstance(payload.get("tags"), str):
+        tags = [t.strip() for t in payload.get("tags").split(",") if t.strip()]
+
+    homepage = ""
+    links = payload.get("links") or payload.get("link")
+    if isinstance(links, dict):
+        homepage = links.get("homepage") or links.get("home") or links.get("docs") or ""
+    elif isinstance(links, list):
+        for link in links:
+            if isinstance(link, str) and not homepage:
+                homepage = link
+            elif isinstance(link, dict) and not homepage:
+                homepage = link.get("url") or ""
+
+    if command:
+        entry = {
+            "id": server_id,
+            "name": str(payload.get("name") or payload.get("title") or server_id),
+            "command": command,
+            "args": cmd_args,
+            "env": env_dict,
+            "enabled": True,
+            "auto_start": bool(payload.get("auto_start", True)),
+            "description": str(description),
+            "tags": tags,
+            "homepage": str(homepage),
+            "source": f"mcpjungle:{rel_source}",
+            "origin_file": rel_source,
+        }
+        results[entry["id"]] = entry
+
+    for key in ("servers", "items", "catalog", "definitions"):
+        if isinstance(payload.get(key), list):
+            _extract_jungle_entries(payload.get(key), source, results)
+
+
+@st.cache_data(show_spinner=False)
+def load_mcpjungle_catalog(repo_path: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    repo = os.path.abspath(os.path.expanduser(repo_path or ""))
+    if not repo:
+        return [], []
+    if not os.path.isdir(repo):
+        return [], [f"Répertoire MCPJungle introuvable: {repo}"]
+
+    entries: Dict[str, Dict[str, Any]] = {}
+    warnings: List[str] = []
+    walker = os.walk(repo)
+    for root, dirs, files in walker:
+        dirs[:] = [d for d in dirs if d not in _MCPJ_SKIP_DIRS]
+        for fname in files:
+            lower = fname.lower()
+            if lower.endswith(".json"):
+                path = os.path.join(root, fname)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    rel = os.path.relpath(path, repo)
+                    _extract_jungle_entries(data, rel, entries)
+                except Exception as e:
+                    warnings.append(f"Impossible de lire {fname}: {e}")
+            elif lower.endswith((".yaml", ".yml")):
+                if not yaml:
+                    msg = "PyYAML non installé — fichiers YAML ignorés."
+                    if msg not in warnings:
+                        warnings.append(msg)
+                    continue
+                path = os.path.join(root, fname)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = yaml.safe_load(f)
+                    rel = os.path.relpath(path, repo)
+                    _extract_jungle_entries(data, rel, entries)
+                except Exception as e:
+                    warnings.append(f"Impossible de lire {fname}: {e}")
+
+    ordered = sorted(entries.values(), key=lambda e: (e.get("name") or e.get("id")))
+    return ordered, warnings
+
+
+def _ensure_unique_server_id(existing: List[Dict[str, Any]], base_id: str) -> str:
+    ids = {s.get("id") for s in existing}
+    if base_id not in ids:
+        return base_id
+    suffix = 2
+    while f"{base_id}_{suffix}" in ids:
+        suffix += 1
+    return f"{base_id}_{suffix}"
+
+
+def import_mcpjungle_server(entry: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    mcp_cfg = cfg.setdefault("mcp", {})
+    servers = mcp_cfg.setdefault("servers", [])
+    entry_id = entry.get("id") or uuid.uuid4().hex[:8]
+    target_id = _ensure_unique_server_id(servers, entry_id)
+    new_server = {
+        "id": target_id,
+        "name": entry.get("name") or target_id,
+        "command": entry.get("command", ""),
+        "args": entry.get("args") or [],
+        "env": entry.get("env") or {},
+        "enabled": True,
+        "auto_start": bool(entry.get("auto_start", True)),
+    }
+    extra_keys = {k: v for k, v in entry.items() if k not in new_server}
+    for k, v in extra_keys.items():
+        new_server[k] = copy.deepcopy(v)
+
+    # Recherche d'un serveur existant basé sur la source
+    existing = None
+    source = entry.get("source")
+    if source:
+        for server in servers:
+            if server.get("source") == source:
+                existing = server
+                break
+    if existing is None:
+        servers.append(new_server)
+        existing = new_server
+    else:
+        existing.update(new_server)
+    return existing
 
 def mcp_list_tools_via_stdio(command: str, args: List[str], env: Dict[str, str]) -> List[str]:
     """Liste les tools d'un serveur MCP via stdio."""
@@ -1549,6 +1755,84 @@ with tab_settings:
                     st.success("Chargé") if ok else st.error("Échec warm-up")
 
     with t4:
+        st.write("**MCP Jungle (catalogue)**")
+        jungle_cfg = CFG.setdefault("mcp", {}).setdefault("jungle", {})
+        jungle_cfg["enabled"] = st.toggle("Activer MCPJungle", value=bool(jungle_cfg.get("enabled", True)))
+        jungle_cfg["repo_path"] = st.text_input(
+            "Chemin du dépôt MCPJungle",
+            value=jungle_cfg.get("repo_path", ""),
+            placeholder="~/dev/MCPJungle"
+        )
+        col_j1, col_j2 = st.columns([1, 3])
+        with col_j1:
+            if st.button("🔄 Recharger le catalogue", key="mcpjungle_reload"):
+                load_mcpjungle_catalog.clear()
+                jungle_cfg["last_scan"] = time.time()
+                st.rerun()
+        with col_j2:
+            st.caption("Le dépôt MCPJungle contient des définitions de serveurs MCP prêtes à l'emploi.")
+
+        jungle_entries: List[Dict[str, Any]] = []
+        jungle_warnings: List[str] = []
+        repo_path = jungle_cfg.get("repo_path", "").strip()
+        if jungle_cfg.get("enabled") and repo_path:
+            jungle_entries, jungle_warnings = load_mcpjungle_catalog(repo_path)
+            if jungle_entries:
+                jungle_cfg["last_scan"] = time.time()
+        elif not repo_path:
+            jungle_warnings.append("Renseigne le chemin du dépôt MCPJungle pour charger le catalogue.")
+
+        for warn in jungle_warnings:
+            st.warning(warn)
+
+        if jungle_cfg.get("enabled") and jungle_entries:
+            st.caption(f"{len(jungle_entries)} serveur(s) détecté(s) dans MCPJungle.")
+            jungle_selected = jungle_cfg.setdefault("selected", [])
+            servers = CFG.setdefault("mcp", {}).setdefault("servers", [])
+            for entry in jungle_entries:
+                container = st.container()
+                with container:
+                    header = f"**{entry.get('name', entry.get('id'))}** · `{entry.get('id')}`"
+                    st.markdown(header)
+                    if entry.get("description"):
+                        st.write(entry.get("description"))
+                    tags = entry.get("tags") or []
+                    info_bits = []
+                    if tags:
+                        info_bits.append("Tags: " + ", ".join(tags))
+                    if entry.get("homepage"):
+                        info_bits.append(f"Lien: {entry.get('homepage')}")
+                    if info_bits:
+                        st.caption(" · ".join(info_bits))
+                    cmd_preview = " ".join([entry.get("command", "")] + entry.get("args", []))
+                    st.code(cmd_preview or "(commande vide)", language="bash")
+                    if entry.get("env"):
+                        env_lines = [f"{k}={v}" for k, v in entry["env"].items()]
+                        st.caption("ENV: " + ", ".join(env_lines))
+                    already = next((s for s in servers if s.get("source") == entry.get("source")), None)
+                    col_a, col_b = st.columns([1, 1])
+                    if already:
+                        with col_a:
+                            if st.button("Mettre à jour", key=f"mcpjungle_sync_{entry['id']}"):
+                                import_mcpjungle_server(entry, CFG)
+                                if entry.get("source") and entry.get("source") not in jungle_selected:
+                                    jungle_selected.append(entry.get("source"))
+                                st.success("Serveur synchronisé depuis MCPJungle.")
+                                st.rerun()
+                        with col_b:
+                            st.caption("Déjà importé dans la configuration.")
+                    else:
+                        with col_a:
+                            if st.button("Importer", key=f"mcpjungle_add_{entry['id']}"):
+                                import_mcpjungle_server(entry, CFG)
+                                if entry.get("source") and entry.get("source") not in jungle_selected:
+                                    jungle_selected.append(entry.get("source"))
+                                st.success("Serveur ajouté depuis MCPJungle.")
+                                st.rerun()
+                        with col_b:
+                            st.caption(entry.get("origin_file", ""))
+            st.markdown("---")
+
         st.write("**Serveurs MCP (legacy)**")
         servers = CFG.setdefault("mcp", {}).setdefault("servers", [])
         add_col, _ = st.columns([1, 4])
