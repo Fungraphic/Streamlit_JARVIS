@@ -39,12 +39,29 @@ DEFAULT_CFG: Dict[str, Any] = {
         "num_ctx": 4096,
         "stream": False,
     },
-    # --- MCP: configuration simplifiée (via MCPJungle Gateway) ---
+    # --- LLM / Prompt système ---
+    "llm": {
+        "system_prompt": (
+            "Tu es JARVIS, un assistant francophone, concis et utile.\n"
+            "Tu as accès à des outils exposés via un Gateway MCP. Utilise les outils lorsque c’est pertinent, "
+            "et intègre leurs résultats pour répondre. Si aucun outil n’est nécessaire, réponds directement.\n"
+            "Toujours répondre en français, de façon brève et précise. Cite les URLs si présentes dans le contexte.\n"
+        ),
+        # Héritage / options d’agent
+        "agent_enabled": False,        # (legacy) heuristique bloc JSON
+        "agent_max_rounds": 3,         # nombre max de tours pour l’agent (tool-calling inclus)
+        "selector_json": False,        # (legacy) sélecteur JSON manuel
+        "use_ollama_tools": True       # <-- clé principale : activer tool-calling natif Ollama
+    },
+    # --- MCP: configuration via MCPJungle Gateway ---
     "mcp": {
         "gateway": {
             "enabled": True,
-            "base_url": "http://127.0.0.1:8080",  # ou un endpoint de groupe, ex: http://127.0.0.1:8080/v0/groups/<name>/mcp
-            "auth_header": ""                      # ex: "Bearer xxxxx"
+            "base_url": "http://127.0.0.1:8080",  # /mcp (Streamable HTTP) ou /sse (fallback)
+            "auth_header": "",                     # ex: "Bearer xxxxx"
+            "auto_web": False,                     # <- OFF par défaut pour forcer le modèle à choisir les tools
+            "auto_web_topk": 5,
+            "chat_shortcuts": True                 # /web /fetch /tool
         }
     },
     "jarvis": {
@@ -65,8 +82,8 @@ os.makedirs(MCP_LOG_DIR, exist_ok=True)
 
 def _normalize_mcp_gateway(cfg: Dict[str, Any]) -> None:
     """
-    Normalise la section MCP pour la nouvelle topologie 'gateway'.
-    - Écrase les anciens champs 'servers', 'proxy', 'jungle' s'ils existent.
+    Normalise la section MCP pour la topologie 'gateway'.
+    Purge les anciennes clés (servers/proxy/jungle).
     """
     mcp = cfg.setdefault("mcp", {})
     gw = mcp.get("gateway") or {}
@@ -74,8 +91,10 @@ def _normalize_mcp_gateway(cfg: Dict[str, Any]) -> None:
         "enabled": bool(gw.get("enabled", True)),
         "base_url": str(gw.get("base_url", "http://127.0.0.1:8080")),
         "auth_header": str(gw.get("auth_header", "")),
+        "auto_web": bool(gw.get("auto_web", False)),
+        "auto_web_topk": int(gw.get("auto_web_topk", 5)),
+        "chat_shortcuts": bool(gw.get("chat_shortcuts", True)),
     }
-    # purge legacy clés si présentes
     for legacy in ("servers", "proxy", "jungle"):
         if legacy in mcp:
             try:
@@ -90,7 +109,6 @@ def load_cfg() -> Dict[str, Any]:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 cfg = copy.deepcopy(DEFAULT_CFG)
-                # merge shallow par section
                 for k, v in (data or {}).items():
                     if isinstance(v, dict):
                         cfg[k] = {**cfg.get(k, {}), **copy.deepcopy(v)}
@@ -162,8 +180,7 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
         "OLLAMA_TEMPERATURE": str(ollama_cfg.get("temperature", 0.7)),
         "OLLAMA_NUM_CTX": str(ollama_cfg.get("num_ctx", 4096)),
         "OLLAMA_STREAM": "1" if ollama_cfg.get("stream") else "0",
-        # compat: plus de liste de serveurs locale => passe un tableau vide
-        "MCP_SERVERS_JSON": "[]",
+        "MCP_SERVERS_JSON": "[]",  # Legacy compat
     }
     for key, value in env_map.items():
         if value is None:
@@ -201,17 +218,30 @@ def is_ollama_up(host: str) -> bool:
         return False
 
 def _build_ollama_chat_messages(messages):
-    """Construit la liste des messages au format Ollama."""
+    """Construit la liste des messages au format Ollama en préfixant le prompt système (si fourni)."""
+    sys_prompt = ""
+    try:
+        sys_prompt = (CFG.get("llm", {}) or {}).get("system_prompt", "") or ""
+        sys_prompt = str(sys_prompt).strip()
+    except Exception:
+        sys_prompt = ""
     mapped = []
     for m in messages[-20:]:
         role = m.get("role", "user")
         content = m.get("content", "")
         if not content:
             continue
-        if role not in ("user", "assistant", "system"):
+        if role not in ("user", "assistant", "system", "tool"):
             role = "assistant" if role != "user" else "user"
-        mapped.append({"role": role, "content": content})
-    if mapped and mapped[0]["role"] == "assistant":
+        obj = {"role": role, "content": content}
+        # si le message inclut des champs avancés (tool_calls/thinking) on les garde
+        for k in ("tool_calls", "thinking", "tool_name"):
+            if k in m:
+                obj[k] = m[k]
+        mapped.append(obj)
+    if sys_prompt:
+        mapped = [{"role": "system", "content": sys_prompt}] + mapped
+    elif mapped and mapped[0]["role"] == "assistant":
         mapped = [{"role": "system", "content": "You are Jarvis."}] + mapped
     return mapped
 
@@ -238,10 +268,13 @@ def ollama_reply(cfg, messages) -> str:
         data = r.json() or {}
         return (data.get("message") or {}).get("content") or ""
     except Exception:
+        # Fallback /api/generate
         try:
             last_user = next((m["content"] for m in reversed(messages) if m.get("role")=="user"), "")
+            sys_prompt = (CFG.get("llm", {}) or {}).get("system_prompt", "") or ""
+            base_prompt = (sys_prompt + "\n\n" if sys_prompt else "") + last_user
             url = host.rstrip("/") + "/api/generate"
-            payload = {"model": model, "prompt": last_user, "stream": False, "options": options}
+            payload = {"model": model, "prompt": base_prompt, "stream": False, "options": options}
             r = requests.post(url, json=payload, timeout=120)
             r.raise_for_status()
             data = r.json() or {}
@@ -355,27 +388,31 @@ def _fmt_call_result(result: Any) -> str:
 def _mcp_gateway_cfg() -> Dict[str, Any]:
     return (CFG.get("mcp", {}).get("gateway") or {})
 
-def mcp_list_tools_via_gateway() -> List[str]:
-    """Liste les tools du gateway MCPJungle. Préfère Streamable HTTP (/mcp), fallback SSE (/sse)."""
+# --- Liste complète des tools (avec schema) ---
+def mcp_list_tools_full_via_gateway() -> List[Dict[str, Any]]:
+    """
+    Récupère name/description/inputSchema pour chaque tool via Streamable HTTP (/mcp) ou SSE (/sse).
+    """
     gw = _mcp_gateway_cfg()
     base = (gw.get("base_url", "") or "").rstrip("/")
-    headers = {}
-    if gw.get("auth_header"):
-        headers["Authorization"] = gw["auth_header"]
+    headers = {"Authorization": gw["auth_header"]} if gw.get("auth_header") else {}
 
-    # Streamable HTTP d'abord
     try:
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client  # SDK Python récent
+        from mcp.client.streamable_http import streamablehttp_client  # transport moderne
         async def _go():
             async with streamablehttp_client(f"{base}/mcp", headers=headers) as (r, w, _):
                 async with ClientSession(r, w) as sess:
                     await sess.initialize()
                     resp = await sess.list_tools()
-                    return [t.name for t in (resp.tools or [])]
+                    return [dict(
+                        name=t.name,
+                        description=(t.description or ""),
+                        inputSchema=(getattr(t, "inputSchema", None) or {})
+                    ) for t in (resp.tools or [])]
         return asyncio.run(_go())
     except Exception:
-        # Fallback SSE
+        # Fallback SSE (certains gateways exposent aussi /sse)
         from mcp import ClientSession
         from mcp.client.sse import sse_client
         async def _go_sse():
@@ -383,16 +420,18 @@ def mcp_list_tools_via_gateway() -> List[str]:
                 async with ClientSession(r, w) as sess:
                     await sess.initialize()
                     resp = await sess.list_tools()
-                    return [t.name for t in (resp.tools or [])]
+                    return [dict(
+                        name=t.name,
+                        description=(t.description or ""),
+                        inputSchema=(getattr(t, "inputSchema", None) or {})
+                    ) for t in (resp.tools or [])]
         return asyncio.run(_go_sse())
 
 def mcp_call_tool_via_gateway(tool: str, arguments: Dict[str, Any], timeout_s: int = 60) -> str:
     """Appelle un tool via le gateway MCPJungle."""
     gw = _mcp_gateway_cfg()
     base = (gw.get("base_url", "") or "").rstrip("/")
-    headers = {}
-    if gw.get("auth_header"):
-        headers["Authorization"] = gw["auth_header"]
+    headers = {"Authorization": gw["auth_header"]} if gw.get("auth_header") else {}
 
     # Streamable HTTP
     try:
@@ -409,7 +448,6 @@ def mcp_call_tool_via_gateway(tool: str, arguments: Dict[str, Any], timeout_s: i
                     return _fmt_call_result(res)
         return asyncio.run(_go())
     except Exception:
-        # Fallback SSE
         from mcp import ClientSession
         from mcp.client.sse import sse_client
         async def _go_sse():
@@ -422,6 +460,194 @@ def mcp_call_tool_via_gateway(tool: str, arguments: Dict[str, Any], timeout_s: i
                         return "[MCP] Timeout d'exécution du tool."
                     return _fmt_call_result(res)
         return asyncio.run(_go_sse())
+
+# ---------- DDG helpers (via Gateway) ----------
+def ddg_search(query: str, topk: int = 5) -> str:
+    """Recherche DDG via le Gateway (tool: ddg__search)."""
+    try:
+        args = {"query": query, "max_results": int(topk)}
+        out = mcp_call_tool_via_gateway("ddg__search", args, timeout_s=60)
+        return out or "(vide)"
+    except Exception as e:
+        return f"[MCP/ddg__search] {e}"
+
+def ddg_fetch(url: str) -> str:
+    """Fetch contenu via le Gateway (tool: ddg__fetch_content)."""
+    try:
+        out = mcp_call_tool_via_gateway("ddg__fetch_content", {"url": url}, timeout_s=60)
+        return out or "(vide)"
+    except Exception as e:
+        return f"[MCP/ddg__fetch_content] {e}"
+
+# ---------- Agent (legacy) : détection JSON dans le texte ----------
+_TOOL_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*([\s\S]*?)\s*```$", re.IGNORECASE | re.MULTILINE)
+_BRACED_JSON_RE = re.compile(r"\{[\s\S]*\}")
+
+def _extract_tool_json(text: str) -> Optional[Dict[str, Any]]:
+    """Extrait {"tool": "...", "args": {...}} depuis 'text' si présent."""
+    if not text:
+        return None
+    candidate = None
+    m = _TOOL_JSON_FENCE_RE.search(text)
+    if m:
+        candidate = m.group(1).strip()
+    if not candidate:
+        for mm in _BRACED_JSON_RE.finditer(text):
+            blob = mm.group(0).strip()
+            if 2 <= len(blob) <= 4000:
+                candidate = blob
+                break
+    if not candidate:
+        return None
+    try:
+        data = json.loads(candidate)
+        if isinstance(data, dict) and "tool" in data and isinstance(data.get("args", {}), dict):
+            return data
+    except Exception:
+        return None
+    return None
+
+def maybe_run_tool_and_answer(cfg: Dict[str, Any], msgs: List[Dict[str, str]], llm_first_reply: str) -> Optional[str]:
+    """
+    (Legacy) Si 'llm_first_reply' contient un JSON d'appel d'outil, exécute l’outil via MCP,
+    insère le résultat, puis relance le LLM. Retourne la réponse finale si un outil a été utilisé.
+    """
+    if not (cfg.get("llm", {}).get("agent_enabled", False)):
+        return None
+    max_rounds = int(cfg.get("llm", {}).get("agent_max_rounds", 2))
+    used_any_tool = False
+    current_reply = llm_first_reply
+
+    for _ in range(max_rounds):
+        call = _extract_tool_json(current_reply or "")
+        if not call:
+            break
+        tool_name = str(call.get("tool", "")).strip()
+        args = call.get("args", {}) or {}
+        if not tool_name:
+            break
+        used_any_tool = True
+        msgs.append({"role": "assistant", "content": f"[Agent] Appel outil demandé : {tool_name} {json.dumps(args, ensure_ascii=False)}"})
+        out = mcp_call_tool_via_gateway(tool_name, args, timeout_s=90)
+        msgs.append({"role": "assistant", "content": f"[Résultat outil: {tool_name}]\n{out}"})
+        msgs.append({"role": "user", "content": "À partir du résultat d’outil ci-dessus, réponds brièvement en français et cite les URLs si pertinentes."})
+        current_reply = ollama_reply(cfg, msgs)
+
+    if used_any_tool:
+        msgs.append({"role": "assistant", "content": current_reply or "(réponse vide)"})
+        return current_reply or ""
+    return None
+
+# ---------- NOUVEAU : Tool-calling natif Ollama (boucle d'agent) ----------
+def build_ollama_tools_from_mcp() -> List[Dict[str, Any]]:
+    """
+    Transforme les tools MCP (name/description/inputSchema) en liste Ollama 'tools'.
+    """
+    tools = []
+    for t in mcp_list_tools_full_via_gateway() or []:
+        name = t.get("name") or ""
+        if not name:
+            continue
+        desc = t.get("description") or ""
+        schema = t.get("inputSchema") or {}
+        # Schéma JSON MCP ~ JSON Schema → directement mappé dans "parameters"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": schema if isinstance(schema, dict) else {}
+            }
+        }
+        tools.append(tool)
+    return tools
+
+def chat_with_tools_agent(cfg: Dict[str, Any], user_text: str, ui_msgs: List[Dict[str, str]]) -> Optional[str]:
+    """
+    Boucle d’agent Tool-Calling:
+      - Passe la liste des tools à Ollama
+      - Laisse le modèle décider d’appeler 0..N tools
+      - Exécute chaque tool_call via MCP puis renvoie les résultats (role='tool')
+      - Reboucle jusqu’à absence de tool_calls ou max_rounds atteint
+    Retourne la réponse finale (texte) ou None si échec.
+    """
+    if not cfg.get("llm", {}).get("use_ollama_tools", True):
+        return None
+    host = cfg["ollama"]["host"]
+    model = cfg["ollama"]["model"]
+    if not is_ollama_up(host):
+        return None
+
+    tools = build_ollama_tools_from_mcp()
+    if not tools:
+        return None  # pas de tools disponibles
+
+    max_rounds = int(cfg.get("llm", {}).get("agent_max_rounds", 3))
+    options = {
+        "temperature": float(cfg["ollama"].get("temperature", 0.7)),
+        "num_ctx": int(cfg["ollama"].get("num_ctx", 4096)),
+    }
+
+    # Fil de conversation minimal pour l’agent
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": (cfg.get("llm", {}).get("system_prompt") or "You are Jarvis.")},
+        {"role": "user", "content": user_text},
+    ]
+
+    url = host.rstrip("/") + "/api/chat"
+    final_answer = None
+
+    for _ in range(max_rounds):
+        payload = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "stream": False,
+            "options": options,
+            # "think": False,  # activer si vous utilisez des modèles "thinking"
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=180)
+            r.raise_for_status()
+            data = r.json() or {}
+        except Exception as e:
+            ui_msgs.append({"role": "assistant", "content": f"[Agent] Erreur appel Ollama: {e}"})
+            return None
+
+        msg = (data.get("message") or {})
+        # Conserver la trace assistant (peut inclure du contenu et/ou des tool_calls)
+        messages.append(msg)
+
+        # Si le modèle a déjà donné une réponse finale SANS tool_calls, on sort
+        tool_calls = msg.get("tool_calls") or []
+        content = (msg.get("content") or "").strip()
+
+        if tool_calls:
+            # Exécuter les outils demandés
+            for call in tool_calls:
+                fn = (call.get("function") or {})
+                tname = str(fn.get("name") or "").strip()
+                targs = fn.get("arguments") or {}
+                ui_msgs.append({"role": "assistant", "content": f"[Agent] Appel tool: {tname} args={json.dumps(targs, ensure_ascii=False)}"})
+                try:
+                    result = mcp_call_tool_via_gateway(tname, targs, timeout_s=90)
+                except Exception as e:
+                    result = f"[MCP] Erreur exécution tool {tname}: {e}"
+                # Ajoute la réponse du tool (role='tool') pour le prochain tour
+                messages.append({"role": "tool", "tool_name": tname, "content": str(result)})
+                ui_msgs.append({"role": "assistant", "content": f"[Résultat tool {tname}]\n{(str(result) or '(vide)')[:8000]}"})
+            # Boucle et renvoyer la réponse finale après avoir ajouté les messages 'tool'
+            continue
+
+        # Pas de tool_calls → la réponse actuelle est finale
+        final_answer = content or ""
+        break
+
+    # Si on a une réponse finale vide, tenter un fallback simple
+    if final_answer is None:
+        final_answer = content or ""
+
+    return final_answer or None
 
 # -------------- Jarvis runtime (local) --------------
 if "jarvis_mod" not in st.session_state:
@@ -578,13 +804,97 @@ def _update_speaking_state_from_logs(logs: List[str]):
     st.session_state.last_assistant_ts = last_ts
     st.session_state.assistant_speaking = speaking
 
-new_logs = drain_jarvis_logs() if st.session_state.jarvis_running else []
-if new_logs:
-    _update_speaking_state_from_logs(new_logs)
+# ---------- Orchestration message (chat & voix) ----------
+def process_user_text(clean_text: str, origin: str = "chat"):
+    """
+    Pipeline unique : prend la demande utilisateur (chat/voix),
+    (0) essaie l’agent Tool-Calling natif ; sinon (1) applique raccourcis/auto-web ; sinon (2) LLM pur.
+    """
+    msgs = st.session_state.setdefault("messages", [])
+    gw = CFG.get("mcp", {}).get("gateway", {})
+    used_gateway = False
 
-# ---- parsing des logs + mise à jour messages ----
+    # --- (0) Tool-calling natif Ollama en priorité
+    if CFG.get("llm", {}).get("use_ollama_tools", True):
+        msgs.append({"role":"user","content":clean_text})
+        final = chat_with_tools_agent(CFG, clean_text, msgs)
+        if isinstance(final, str) and final.strip():
+            msgs.append({"role":"assistant","content": final})
+            st.session_state["messages"] = msgs[-200:]
+            st.session_state.last_assistant_ts = time.time()
+            st.session_state.assistant_speaking = True
+            return
+        # sinon: on continue (raccourcis/auto-web/LLM pur)
+
+    # (1) Raccourcis en mode chat
+    if origin == "chat" and gw.get("chat_shortcuts", True) and gw.get("enabled", True):
+        m_ddg = re.match(r"^/(?:web|ddg)\s+(.+)$", clean_text, flags=re.IGNORECASE)
+        m_fetch = re.match(r"^/fetch\s+(\S+)$", clean_text, flags=re.IGNORECASE)
+        m_tool  = re.match(r"^/tool\s+([A-Za-z0-9_.:\-]+)\s*(.*)$", clean_text)
+        if m_ddg:
+            query = m_ddg.group(1).strip()
+            msgs.append({"role":"user","content":clean_text})
+            ctx = f"[WEB/DDG] Résultats pour: {query}\n{ddg_search(query, topk=int(gw.get('auto_web_topk',5)))}\n\n"
+            msgs.append({"role":"assistant","content":ctx})
+            msgs.append({"role":"user","content":"Sur la base du contexte web ci-dessus, réponds de façon concise."})
+            reply = ollama_reply(CFG, msgs)
+            final = maybe_run_tool_and_answer(CFG, msgs, reply)
+            if final is None:
+                msgs.append({"role":"assistant","content": reply or "(réponse vide)"})
+            used_gateway = True
+        elif m_fetch:
+            url = m_fetch.group(1).strip()
+            msgs.append({"role":"user","content":clean_text})
+            msgs.append({"role":"assistant","content": ddg_fetch(url)})
+            used_gateway = True
+        elif m_tool:
+            tool_name = m_tool.group(1)
+            arg_str   = (m_tool.group(2) or "").strip()
+            try:
+                if arg_str.startswith("{"):
+                    args = json.loads(arg_str)
+                else:
+                    args = {}
+                    for kv in shlex.split(arg_str):
+                        if "=" in kv:
+                            k, v = kv.split("=", 1)
+                            args[k] = v
+            except Exception as e:
+                args = {}
+                msgs.append({"role":"assistant","content": f"[MCP] Args invalides: {e}"})
+            msgs.append({"role":"user","content":clean_text})
+            out = mcp_call_tool_via_gateway(tool_name, args, timeout_s=60)
+            msgs.append({"role":"assistant","content": out or "(vide)"})
+            used_gateway = True
+
+    # (2) Auto-web si activé ET pas déjà utilisé
+    if gw.get("enabled", True) and gw.get("auto_web", False) and not used_gateway:
+        msgs.append({"role":"user","content":clean_text})
+        search_out = ddg_search(clean_text, topk=int(gw.get("auto_web_topk", 5)))
+        ctx = f"[WEB/DDG:auto] Résultats bruts:\n{search_out}\n\n"
+        msgs.append({"role":"assistant","content":ctx})
+        msgs.append({"role":"user","content":"Utilise le contexte DDG ci-dessus pour répondre brièvement."})
+        reply = ollama_reply(CFG, msgs)
+        final = maybe_run_tool_and_answer(CFG, msgs, reply)
+        if final is None:
+            msgs.append({"role":"assistant","content": reply or "(réponse vide)"})
+        used_gateway = True
+
+    # (3) LLM pur (+ agent legacy éventuel)
+    if not used_gateway:
+        msgs.append({"role":"user","content":clean_text})
+        reply = ollama_reply(CFG, msgs)
+        final = maybe_run_tool_and_answer(CFG, msgs, reply)
+        if final is None:
+            msgs.append({"role":"assistant","content": reply or "Réponse vide d'Ollama (vérifie le modèle)."})
+
+    st.session_state["messages"] = msgs[-200:]
+    st.session_state.last_assistant_ts = time.time()
+    st.session_state.assistant_speaking = True
+
+new_logs = drain_jarvis_logs() if st.session_state.jarvis_running else []
 def _ingest_chat_from_logs(logs: List[str]):
-    """Ingère les messages chat depuis les logs."""
+    """Ingère les messages chat depuis les logs + déclenche pipeline voix."""
     if not logs:
         return
     msgs = st.session_state.setdefault("messages", [])
@@ -593,14 +903,16 @@ def _ingest_chat_from_logs(logs: List[str]):
         line = (raw or "").strip()
         if not line:
             continue
-        if line.startswith("[VU]"):
-            continue
         m_user = re.match(r'^\[(?:STT|VOICE)\]\s*(?:Vous|You)\s*:\s*(.+)$', line, flags=re.IGNORECASE)
         if m_user:
             content = m_user.group(1).strip()
             if content:
                 msgs.append({"role": "user", "content": content})
                 changed = True
+                try:
+                    process_user_text(content, origin="voice")
+                except Exception as e:
+                    msgs.append({"role":"assistant","content": f"[VOIX] erreur: {e}"})
             continue
         m_ass = re.match(r'^(?:JARVIS|Assistant)\s*:\s*(.+)$', line, flags=re.IGNORECASE)
         if m_ass:
@@ -613,7 +925,9 @@ def _ingest_chat_from_logs(logs: List[str]):
         st.session_state["messages"] = msgs[-200:]
         st.rerun()
 
-_ingest_chat_from_logs(new_logs)
+if new_logs:
+    _update_speaking_state_from_logs(new_logs)
+    _ingest_chat_from_logs(new_logs)
 
 # -------------- ORT providers (affichage dans topbar) --------------
 def _ort_providers() -> Tuple[List[str], str]:
@@ -733,7 +1047,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------- Helper pour afficher le radar (dans un composant HTML dédié) ----------
+# ---------- Helper pour afficher le radar ----------
 def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]]):
     svg_cls = "speaking" if speaking else ""
     center_cls = "speaking" if speaking else ""
@@ -794,17 +1108,14 @@ def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]
           opacity: 0;
           transition: opacity .25s ease;
         }}
-
         .radar-container[data-speaking="false"] .wave {{
           opacity: 0 !important;
         }}
-
         @media (prefers-reduced-motion: reduce) {{
           .wave {{
             transition: none;
           }}
         }}
-
         .radar-status {{
           text-align:center; margin-top:8px; color:#44f1ff; font-size:13px;
           letter-spacing:1px; text-transform:uppercase;
@@ -835,9 +1146,9 @@ def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]
             <line x1="150" y1="10"  x2="150" y2="290" stroke="#00d4e8" stroke-width="1" opacity="0.2"/>
 
             <g id="waves">
-              <circle class="wave wave-1" cx="150" cy="150" r="35" filter="url(#glow)"/>
-              <circle class="wave wave-2" cx="150" cy="150" r="35" filter="url(#glow)"/>
-              <circle class="wave wave-3" cx="150" cy="150" r="35" filter="url(#glow)"/>
+              <circle class="wave wave-1" cx="150" cy="150" r="35"/>
+              <circle class="wave wave-2" cx="150" cy="150" r="35"/>
+              <circle class="wave wave-3" cx="150" cy="150" r="35"/>
             </g>
 
             <circle class="radar-center-circle {center_cls}" cx="150" cy="150" r="28"/>
@@ -949,11 +1260,6 @@ def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]
           }};
 
           const animate = (now) => {{
-            if (prefersReducedMotion) {{
-              requestAnimationFrame(animate);
-              return;
-            }}
-
             samples = samples.filter((sample) => now - sample.time <= 2600);
             if (!samples.length) {{
               samples.push({{ level: 0, time: now }});
@@ -969,7 +1275,7 @@ def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]
               container.setAttribute('data-speaking', String(speaking));
               if (speaking && !attrSpeaking) {{
                 svg.classList.add('speaking');
-              }} else if (!speaking && attrSpeaking) {{
+              }} else {{
                 svg.classList.remove('speaking');
               }}
               if (speaking) {{
@@ -1031,7 +1337,7 @@ with tab_interface:
 
     mode = st.session_state.get("interaction_mode", "chat")
 
-    c1, c2 = st.columns([5,7])
+    c1, c2 = st.columns([5, 7])
     with c1:
         # Radar
         render_radar(
@@ -1134,38 +1440,7 @@ with tab_interface:
             if submitted and mode == "chat":
                 clean_text = (user_text or "").strip()
                 if clean_text:
-                    used_gateway = False
-                    # --- Raccourci: /tool <nom> {json}
-                    m_tool = re.match(r"^/tool\s+([A-Za-z0-9_.:\-]+)\s*(.*)$", clean_text)
-                    if m_tool and CFG["mcp"]["gateway"].get("enabled", True):
-                        tool_name = m_tool.group(1)
-                        arg_str = (m_tool.group(2) or "").strip()
-                        try:
-                            if arg_str.startswith("{"):
-                                args = json.loads(arg_str)
-                            else:
-                                args = {}
-                                for kv in shlex.split(arg_str):
-                                    if "=" in kv:
-                                        k, v = kv.split("=", 1)
-                                        args[k] = v
-                        except Exception as e:
-                            args = {}
-                            msgs.append({"role": "assistant", "content": f"[MCP] Args invalides: {e}"})
-                        msgs.append({"role": "user", "content": clean_text})
-                        out = mcp_call_tool_via_gateway(tool_name, args, timeout_s=60)
-                        msgs.append({"role": "assistant", "content": out or "(vide)"})
-                        used_gateway = True
-
-                    # --- Sinon: LLM pur
-                    if not used_gateway:
-                        msgs.append({"role": "user", "content": clean_text})
-                        reply = ollama_reply(CFG, msgs) or "Réponse vide d'Ollama (vérifie le modèle)."
-                        msgs.append({"role": "assistant", "content": reply})
-
-                    st.session_state["messages"] = msgs[-200:]
-                    st.session_state.last_assistant_ts = time.time()
-                    st.session_state.assistant_speaking = True
+                    process_user_text(clean_text, origin="chat")
                     st.rerun()
 
         if mode == "vocal":
@@ -1339,6 +1614,41 @@ with tab_settings:
         CFG["ollama"]["temperature"] = st.slider("Température", 0.0, 1.5, float(CFG["ollama"]["temperature"]), 0.05)
         CFG["ollama"]["num_ctx"] = st.number_input("Contexte (num_ctx)", 512, 16384, int(CFG["ollama"]["num_ctx"]), 512)
         CFG["ollama"]["stream"] = st.toggle("Streaming tokens", value=bool(CFG["ollama"]["stream"]))
+        st.markdown("---")
+        st.write("**Prompt & Agent**")
+        CFG.setdefault("llm", {})
+        CFG["llm"]["system_prompt"] = st.text_area(
+            "Texte injecté au début de chaque conversation (rôle system)",
+            value=CFG["llm"].get("system_prompt", ""),
+            height=220,
+            help="Décris le rôle, l’usage des tools MCP et le style de réponse."
+        )
+        cols_agent = st.columns(4)
+        with cols_agent[0]:
+            CFG["llm"]["use_ollama_tools"] = st.toggle(
+                "⚒️ Tool-calling natif (reco.)",
+                value=bool(CFG["llm"].get("use_ollama_tools", True)),
+                help="Passe la liste des tools au modèle et exécute automatiquement les tool_calls."
+            )
+        with cols_agent[1]:
+            CFG["llm"]["agent_max_rounds"] = st.number_input(
+                "Boucles max agent",
+                min_value=1, max_value=8,
+                value=int(CFG["llm"].get("agent_max_rounds", 3)),
+                step=1
+            )
+        with cols_agent[2]:
+            CFG["llm"]["agent_enabled"] = st.toggle(
+                "Heuristique bloc JSON (legacy)",
+                value=bool(CFG["llm"].get("agent_enabled", False)),
+                help="Détecte un ```json``` dans le texte du modèle."
+            )
+        with cols_agent[3]:
+            CFG["llm"]["selector_json"] = st.toggle(
+                "Sélecteur JSON manuel (legacy)",
+                value=bool(CFG["llm"].get("selector_json", False)),
+                help="Ancien flux: forcer une sélection d’outil via format JSON."
+            )
 
         st.markdown("---")
         colA, colB, colC, colD = st.columns(4)
@@ -1394,14 +1704,19 @@ with tab_settings:
         with colA:
             if st.button("🔍 Lister tools (Gateway)"):
                 try:
-                    tools = mcp_list_tools_via_gateway()
-                    st.success(", ".join(tools) or "(aucun)")
+                    tools = mcp_list_tools_full_via_gateway()
+                    if tools:
+                        # aperçu compact
+                        preview = "\n".join([f"- {t['name']}: {t.get('description','')}" for t in tools])
+                        st.success(preview[:3000] if len(preview) > 3000 else preview)
+                    else:
+                        st.info("(aucun)")
                 except Exception as e:
                     st.error(f"list_tools: {e}")
         with colB:
             with st.popover("▶️ Appeler un tool (Gateway)"):
-                tname = st.text_input("Nom du tool", placeholder="ex: time__get_current_time")
-                targ  = st.text_area("Arguments (JSON)", placeholder='{"foo":"bar"}', height=120)
+                tname = st.text_input("Nom du tool", placeholder="ex: ddg__search")
+                targ  = st.text_area("Arguments (JSON)", placeholder='{"query":"paris", "max_results": 5}', height=120)
                 if st.button("Exécuter"):
                     try:
                         args = json.loads(targ) if targ.strip() else {}
@@ -1411,6 +1726,7 @@ with tab_settings:
                         st.error(f"call_tool: {e}")
 
         st.caption("Raccourci chat:  `/tool <nom> {json}`  — se connecte au gateway MCPJungle.")
+        st.caption("Raccourcis web:  `/web requête…`  et  `/fetch URL`  (via ddg__search / ddg__fetch_content).")
 
     with t5:
         csa, csb = st.columns(2)
