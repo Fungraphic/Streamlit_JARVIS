@@ -200,6 +200,44 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
         else:
             os.environ[key] = value_str
 
+def _send_mic_state(enabled: bool):
+    """Essaye plusieurs voies: file de commandes q_cmd, fonctions utilitaires, attribut, puis trace."""
+    jm = st.session_state.get("jarvis_mod")
+    state = "ON" if enabled else "OFF"
+    if jm is not None:
+        # 1) File de contrôle (recommandé)
+        for name in ("q_cmd", "q_control", "control_q", "q_in"):
+            q = getattr(jm, name, None)
+            if q is not None:
+                try:
+                    q.put_nowait({"type": "mic", "enabled": bool(enabled)})
+                    break
+                except Exception:
+                    pass
+        else:
+            # 2) Fonctions directes si exposées par jarvis.py
+            for fn_name in ("set_listen_enabled", "set_mic_enabled", "toggle_listen"):
+                fn = getattr(jm, fn_name, None)
+                if callable(fn):
+                    try:
+                        fn(bool(enabled))
+                        break
+                    except Exception:
+                        pass
+            else:
+                # 3) Attribut simple
+                if hasattr(jm, "listen_enabled"):
+                    try:
+                        setattr(jm, "listen_enabled", bool(enabled))
+                    except Exception:
+                        pass
+        # Trace UI -> logs Jarvis
+        try:
+            if hasattr(jm, "q_log"):
+                jm.q_log.put_nowait(f"[UI] MIC {state} demandé (toggle)")
+        except Exception:
+            pass
+
 def fetch_ollama_models(host: str) -> List[str]:
     """Récupère la liste des modèles Ollama disponibles."""
     try:
@@ -958,12 +996,24 @@ def _set_interaction_mode(mode: str):
         st.session_state["chat_input"] = ""
     st.session_state.interaction_mode = mode
     st.session_state.mode_toggle = mode == "vocal"
+    # ⬇️ NOUVEAU : pilote le micro backend en même temps
+    _send_mic_state(mode == "vocal")
 
 def _sync_mode_from_toggle():
     desired = "vocal" if st.session_state.get("mode_toggle") else "chat"
     _set_interaction_mode(desired)
 
-_set_interaction_mode(st.session_state.interaction_mode)
+# _set_interaction_mode(st.session_state.interaction_mode)
+
+def _on_mode_toggle():
+    # Le widget est la vérité : on pousse l’état vers interaction_mode
+    is_vocal = bool(st.session_state.get("mode_toggle"))
+    _set_interaction_mode("vocal" if is_vocal else "chat")
+    # Si tu as implémenté la commande micro :
+    try:
+        _send_mic_state(is_vocal)   # optionnel mais recommandé
+    except Exception:
+        pass
 
 def _load_jarvis_module(path: str):
     spec = importlib.util.spec_from_file_location("jarvis", path)
@@ -1005,6 +1055,8 @@ def start_jarvis(cfg: Dict[str, Any]):
         t.start()
         st.session_state.jarvis_thread = t
         st.session_state.jarvis_running = True
+        # ⬇️ NOUVEAU : applique l’état micro selon le mode actuel
+        _send_mic_state(st.session_state.get("interaction_mode", "chat") == "vocal")
         st.success("Jarvis démarré (audio local).")
     except Exception as e:
         st.error(f"Erreur au démarrage de Jarvis: {e}")
@@ -1754,7 +1806,7 @@ with tab_interface:
                 safe_content = html.escape(str(content))
                 safe_content = re.sub(
                     r'(https?://[^\s<>"\')]+?)(?=[\s<>"\')]|[.,!?;:)](?:\s|$)|$)',
-                    r'<a href="\\g<1>" target="_blank" rel="noopener noreferrer">\\g<1></a>',
+                    r'<a href="\g<1>" target="_blank" rel="noopener noreferrer">\g<1></a>',
                     safe_content,
                 )
                 safe_content = safe_content.replace("\n", "<br />")
@@ -1782,13 +1834,13 @@ with tab_interface:
         # Colonne droite : toggles HORS formulaire (sinon erreur Streamlit)
         with input_cols[1]:
             # st.write("")  # spacer pour alignement vertical
-            st.toggle("🎙️ Vocal", key="mode_toggle", value=st.session_state.mode_toggle, help=None)
+            st.toggle("🎙️ Vocal", key="mode_toggle", on_change=_on_mode_toggle)
             gw_enabled_state = CFG["mcp"]["gateway"].get("enabled", True)
             st.toggle("🌐 MCP", key="gateway_toggle", value=gw_enabled_state, help=None)  # <- renommé
             # Sync session/config sans callback (évite l'erreur dans les forms)
             CFG["mcp"]["gateway"]["enabled"] = bool(st.session_state.get("gateway_toggle", gw_enabled_state))
-            if bool(st.session_state.get("mode_toggle", False)) != (st.session_state.get("interaction_mode") == "vocal"):
-                _sync_mode_from_toggle()
+            # sif bool(st.session_state.get("mode_toggle", False)) != (st.session_state.get("interaction_mode") == "vocal"):
+            # s    _sync_mode_from_toggle()
 
         # Colonne gauche : formulaire de saisie avec bouton à droite (icône)
         with input_cols[0]:
@@ -1894,8 +1946,8 @@ with tab_interface:
                     unsafe_allow_html=True
                 )
 
-        if mode == "vocal":
-            st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
+        # if mode == "vocal":
+        #     st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
 
         # Pompe live des logs si Jarvis tourne
         if st.session_state.get("jarvis_running"):

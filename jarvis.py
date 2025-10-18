@@ -140,6 +140,19 @@ busy = threading.Event()
 stop_main = threading.Event()
 q_log = queue.Queue()
 
+
+# Command queue (UI control) and mic gate
+q_cmd = queue.Queue()
+listen_enabled = True  # mic listening gate; UI can flip to False when chat mode
+
+def set_listen_enabled(enabled: bool):
+    global listen_enabled
+    listen_enabled = bool(enabled)
+    try:
+        q_log.put_nowait(f"[INFO] MIC {'ON' if listen_enabled else 'OFF'} (set_listen_enabled)")
+    except Exception:
+        pass
+
 def log(msg: str):
     print(msg, flush=True)
     try: q_log.put_nowait(msg)
@@ -1061,6 +1074,18 @@ def wake_loop(stt_model: WhisperModel, tts, tok, mdl):
         pass
     log(f"[BG] Écoute du mot-clé '{WAKE_WORD}' (REQUIRE_WAKE={REQUIRE_WAKE}). Ctrl+C pour quitter.")
     while not stop_main.is_set():
+        # Drain UI control commands (mic on/off)
+        try:
+            while True:
+                _cmd = q_cmd.get_nowait()
+                if isinstance(_cmd, dict) and _cmd.get("type") == "mic":
+                    set_listen_enabled(bool(_cmd.get("enabled", True)))
+        except queue.Empty:
+            pass
+        # Gate microphone if disabled
+        if not listen_enabled:
+            time.sleep(0.05)
+            continue
         if busy.is_set():
             time.sleep(0.05); continue
         audio = record_seconds(WAKE_WINDOW_S)
