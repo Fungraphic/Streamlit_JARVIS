@@ -573,7 +573,6 @@ def _fix_placeholder_urls(items: List[Dict[str, Any]], url_candidates: List[str]
       - si des indices différents sont présents -> mapping par indice
       - sinon -> mapping séquentiel (1er item -> 1ère URL, etc.)
     """
-    # collecte des placeholders présents
     placeholders = []
     for it in items:
         url = it.get("url") or it.get("href") or it.get("link") or ""
@@ -1302,12 +1301,94 @@ body::before{
 .bubble{ max-width: 92%; padding:10px 12px; border-radius: 12px; border: 1px solid var(--border); white-space:pre-wrap; overflow-wrap:anywhere; }
 .user{ align-self:flex-end; background: rgba(68,241,255,0.08); }
 .assistant{ align-self:flex-start; background: rgba(255,255,255,0.04); }
-.chat-toggle{ margin-top:8px; }
-.chat-toggle [data-testid="stToggle"]{ width:100%; background: var(--accent); padding:10px 12px; border-radius: 12px; }
-.chat-toggle [data-testid="stToggle"] label{ color: var(--fg); font-weight:600; }
-.chat-toggle [data-testid="stToggle"] [data-testid="stTickBar"]{ background: var(--primary); }
 .chat-input input{ background: var(--accent) !important; color: var(--fg) !important; border:1px solid var(--border); border-radius: 10px; padding:10px 12px; }
 .chat-send button{ background: linear-gradient(180deg, #0b485b, #083947); border:1px solid var(--primary-2); color: white; border-radius: 10px; padding:10px 14px; }
+
+/* --- Barre inline (saisie + toggles + bouton) --- */
+.stColumn > div:has([data-testid="stToggle"]) {
+  display: flex; align-items: center; justify-content: center; height: 100%;
+}
+[data-testid="stToggle"] {
+  background: var(--accent); border: 1px solid var(--border);
+  padding: 8px 10px; border-radius: 10px;
+}
+[data-testid="stToggle"] label { color: var(--fg); font-weight: 600; font-size: 13px; }
+</style>
+""", unsafe_allow_html=True)
+st.markdown("""
+<style>
+/* Overrides spacing toggles */
+.stColumn > div:has([data-testid="stToggle"]) { display:flex; flex-direction:column; align-items:flex-start; justify-content:flex-start; gap:3px; height:auto; }
+[data-testid="stToggle"] { padding:2px 2px; margin:0; }
+div[data-testid="stVerticalBlock"] > div:has(> [data-testid="stToggle"]) { margin:0; }
+</style>
+""", unsafe_allow_html=True)
+st.markdown("""
+<style>
+/* (A) Enlever totalement le header Streamlit (nouvelle structure: <header …>) */
+header[data-testid="stHeader"], [data-testid="stHeader"]{
+  display: none !important;
+  height: 0 !important;
+  min-height: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+/* (B) Retirer la marge du body qui ajoute 8 px en haut */
+html, body{
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+/* (C) Supprimer tout rembourrage supérieur du conteneur principal */
+[data-testid="stAppViewContainer"] > .main{
+  padding-top: 0 !important;
+  margin-top: 0 !important;
+}
+section.main > div.block-container{
+  padding-top: 0 !important;
+}
+
+/* (D) S'assurer que ta topbar colle bien au bord du haut */
+.topbar{ margin-top: 0 !important; }
+</style>
+""", unsafe_allow_html=True)
+st.markdown("""
+<style>
+/* 1) Kill the toolbar spacer completely */
+[data-testid="stToolbar"]{
+  display:none !important;
+  height:0 !important;
+  min-height:0 !important;
+  padding:0 !important;
+  margin:0 !important;
+}
+
+/* (you already hide the header; keep it for safety) */
+header[data-testid="stHeader"], [data-testid="stHeader"], [data-testid="stDecoration"]{
+  display:none !important;
+  height:0 !important; min-height:0 !important;
+  padding:0 !important; margin:0 !important;
+}
+
+/* 2) Remove any top padding still applied to the app containers */
+#root, .stApp, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main{
+  padding-top:0 !important;
+  margin-top:0 !important;
+}
+
+/* 3) Ensure the first block (that contains your .topbar) has no offset */
+.block-container:first-child{
+  padding-top:0 !important;
+  margin-top:0 !important;
+}
+
+/* 4) Force your topbar to start at the absolute top of the viewport */
+.topbar{
+  position: sticky;   /* keep your sticky behavior */
+  top: 0 !important;
+  margin-top: 0 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1645,7 +1726,7 @@ with tab_interface:
 
     mode = st.session_state.get("interaction_mode", "chat")
 
-    c1, c2 = st.columns([5, 7])
+    c1, c2 = st.columns([3, 9])
     with c1:
         render_radar(
             speaking=speaking,
@@ -1656,8 +1737,7 @@ with tab_interface:
     with c2:
         msgs = st.session_state.setdefault("messages", [])
 
-        # ---- Rendu du chat : on n'affiche QUE user/assistant (on masque system/tool)
-        # ---- ET on rend cliquables les URLs.
+        # ---- Rendu du chat (seulement user/assistant)
         def _render_messages(messages: List[Dict[str, str]]) -> str:
             display = [m for m in (messages or []) if m.get("role") in ("user", "assistant")]
             if not display:
@@ -1672,14 +1752,12 @@ with tab_interface:
                 content = msg.get("content", "")
                 cls = "bubble assistant" if role != "user" else "bubble user"
                 safe_content = html.escape(str(content))
-                # Linkification robuste (évite de capturer la ponctuation finale)
                 safe_content = re.sub(
                     r'(https?://[^\s<>"\')]+?)(?=[\s<>"\')]|[.,!?;:)](?:\s|$)|$)',
-                    r'<a href="\g<1>" target="_blank" rel="noopener noreferrer">\g<1></a>',
+                    r'<a href="\\g<1>" target="_blank" rel="noopener noreferrer">\\g<1></a>',
                     safe_content,
                 )
                 safe_content = safe_content.replace("\n", "<br />")
-
                 bubbles.append(f'<div class="{cls}">{safe_content}</div>')
             return f"<div class='msgs' id='chatMsgs'>{''.join(bubbles)}</div>"
 
@@ -1698,120 +1776,56 @@ with tab_interface:
             unsafe_allow_html=True
         )
 
-        # --- Commandes
-        outer_cols = st.columns([3, 12])
-        with outer_cols[0]:
-            st.markdown('<div class="chat-toggle">', unsafe_allow_html=True)
-            st.toggle(
-                "🎙️ Mode vocal",
-                key="mode_toggle",
-                value=st.session_state.mode_toggle,
-                help="Active le mode vocal pour répondre par la voix",
-                on_change=_sync_mode_from_toggle,
+        # --- Ligne d'entrée : textarea (gauche) + toggles (droite)
+        input_cols = st.columns([11, 1])
+
+        # Colonne droite : toggles HORS formulaire (sinon erreur Streamlit)
+        with input_cols[1]:
+            # st.write("")  # spacer pour alignement vertical
+            st.toggle("🎙️ Vocal", key="mode_toggle", value=st.session_state.mode_toggle, help=None)
+            gw_enabled_state = CFG["mcp"]["gateway"].get("enabled", True)
+            st.toggle("🌐 MCP", key="gateway_toggle", value=gw_enabled_state, help=None)  # <- renommé
+            # Sync session/config sans callback (évite l'erreur dans les forms)
+            CFG["mcp"]["gateway"]["enabled"] = bool(st.session_state.get("gateway_toggle", gw_enabled_state))
+            if bool(st.session_state.get("mode_toggle", False)) != (st.session_state.get("interaction_mode") == "vocal"):
+                _sync_mode_from_toggle()
+
+        # Colonne gauche : formulaire de saisie avec bouton à droite (icône)
+        with input_cols[0]:
+            mode = st.session_state.interaction_mode
+            placeholder_text = (
+                "MODE VOCAL ACTIVÉ - Utilise ton micro"
+                if mode == "vocal"
+                else "Écris un message (/tool nom {json}, /web requête, /fetch URL)"
             )
-
-            st.divider()
-            st.write("🔎 **MCP Gateway**")
-            gw_enabled = CFG["mcp"]["gateway"].get("enabled", True)
-            CFG["mcp"]["gateway"]["enabled"] = st.toggle(
-                "Activer le gateway MCPJungle",
-                value=bool(gw_enabled),
-                help="Expose tous tes tools via un endpoint unique."
-            )
-            st.caption("Raccourci chat: `/tool <nom> {json}`  → appelle le tool via le gateway.")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        mode = st.session_state.interaction_mode
-        placeholder_text = (
-            "MODE VOCAL ACTIVÉ - Utilise ton micro"
-            if mode == "vocal"
-            else "MODE CHAT ACTIVÉ - Commence la conversation (astuce: /tool nom {json})"
-        )
-
-        with outer_cols[1]:
             with st.form("chat_form", clear_on_submit=True, border=False):
-                inner_cols = st.columns([8, 3])
+                inner_cols = st.columns([20, 1], vertical_alignment="bottom")
                 with inner_cols[0]:
                     user_text = st.text_area(
                         "Message",
                         key="chat_input",
                         placeholder=placeholder_text,
-                        height=80,
+                        height=40,
                         label_visibility="collapsed",
                         disabled=(mode == "vocal"),
                     )
                 with inner_cols[1]:
                     submitted = st.form_submit_button(
-                        "Envoyer" if mode == "chat" else "🎤 Écoute",
+                        "📨",                   # <- icône d’envoi
                         use_container_width=True,
+                        help="Envoyer",
                         disabled=(mode != "chat"),
                     )
 
-            if submitted and mode == "chat":
-                clean_text = (user_text or "").strip()
-                if clean_text:
-                    # 1) Afficher immédiatement le message user + un placeholder assistant "…"
-                    st.session_state["messages"].append({"role": "user", "content": clean_text})
+        if submitted and mode == "chat":
+            clean_text = (user_text or "").strip()
+            if clean_text:
+                # Affiche tout de suite le message user + placeholder assistant "…"
+                st.session_state["messages"].append({"role": "user", "content": clean_text})
 
-                    # Choix du streaming
-                    use_stream = bool(CFG["ollama"].get("stream")) and not bool(CFG["llm"].get("use_ollama_tools", True))
-                    if not use_stream:
-                        st.session_state["messages"].append({"role": "assistant", "content": "…"})
-                        chat_slot.markdown(
-                            f'''
-                            <div class="card chat-card">
-                              <div class="chat-card-body">
-                                <h3>Chat</h3>
-                                <div class="chat-wrap">
-                                  {_render_messages(st.session_state["messages"][-200:])}
-                                </div>
-                              </div>
-                            </div>
-                            ''',
-                            unsafe_allow_html=True
-                        )
-
-                    if use_stream:
-                        # 2A) Mode streaming (sans tools) : on construit la réponse en direct
-                        st.session_state["messages"].append({"role": "assistant", "content": ""})
-
-                        def _on_delta(tok: str):
-                            st.session_state["messages"][-1]["content"] += tok
-                            msgs_live = st.session_state["messages"][-200:]
-                            chat_slot.markdown(
-                                f'''
-                                <div class="card chat-card">
-                                  <div class="chat-card-body">
-                                    <h3>Chat</h3>
-                                    <div class="chat-wrap">
-                                      {_render_messages(msgs_live)}
-                                    </div>
-                                  </div>
-                                </div>
-                                ''',
-                                unsafe_allow_html=True
-                            )
-
-                        try:
-                            _apply_env_from_cfg(CFG)
-                            ctx_msgs = st.session_state["messages"][-20:]
-                            _ = ollama_stream_chat(CFG, ctx_msgs, _on_delta)
-                        except Exception as e:
-                            st.session_state["messages"][-1]["content"] = f"(Erreur stream Ollama: {e})"
-
-                    else:
-                        # 2B) Traitement normal (tools/auto-web/LLM) — le message user est déjà ajouté
-                        process_user_text(clean_text, origin="chat", already_appended=True)
-
-                        # 3) Retirer le placeholder "…" s'il est toujours là
-                        msgs_now = st.session_state.get("messages", [])
-                        for i in range(len(msgs_now)-1, -1, -1):
-                            if msgs_now[i].get("role") == "assistant" and msgs_now[i].get("content") == "…":
-                                msgs_now.pop(i)
-                                break
-                        st.session_state["messages"] = msgs_now
-
-                    # 4) Repeindre le chat
+                use_stream = bool(CFG["ollama"].get("stream")) and not bool(CFG["llm"].get("use_ollama_tools", True))
+                if not use_stream:
+                    st.session_state["messages"].append({"role": "assistant", "content": "…"})
                     chat_slot.markdown(
                         f'''
                         <div class="card chat-card">
@@ -1826,12 +1840,64 @@ with tab_interface:
                         unsafe_allow_html=True
                     )
 
+                if use_stream:
+                    # Streaming (sans tools)
+                    st.session_state["messages"].append({"role": "assistant", "content": ""})
+
+                    def _on_delta(tok: str):
+                        st.session_state["messages"][-1]["content"] += tok
+                        msgs_live = st.session_state["messages"][-200:]
+                        chat_slot.markdown(
+                            f'''
+                            <div class="card chat-card">
+                              <div class="chat-card-body">
+                                <h3>Chat</h3>
+                                <div class="chat-wrap">
+                                  {_render_messages(msgs_live)}
+                                </div>
+                              </div>
+                            </div>
+                            ''',
+                            unsafe_allow_html=True
+                        )
+
+                    try:
+                        _apply_env_from_cfg(CFG)
+                        ctx_msgs = st.session_state["messages"][-20:]
+                        _ = ollama_stream_chat(CFG, ctx_msgs, _on_delta)
+                    except Exception as e:
+                        st.session_state["messages"][-1]["content"] = f"(Erreur stream Ollama: {e})"
+
+                else:
+                    # Traitement normal (tools/auto-web/LLM)
+                    process_user_text(clean_text, origin="chat", already_appended=True)
+                    # Retirer le placeholder "…"
+                    msgs_now = st.session_state.get("messages", [])
+                    for i in range(len(msgs_now)-1, -1, -1):
+                        if msgs_now[i].get("role") == "assistant" and msgs_now[i].get("content") == "…":
+                            msgs_now.pop(i)
+                            break
+                    st.session_state["messages"] = msgs_now
+
+                # Repeindre le chat
+                chat_slot.markdown(
+                    f'''
+                    <div class="card chat-card">
+                      <div class="chat-card-body">
+                        <h3>Chat</h3>
+                        <div class="chat-wrap">
+                          {_render_messages(st.session_state["messages"][-200:])}
+                        </div>
+                      </div>
+                    </div>
+                    ''',
+                    unsafe_allow_html=True
+                )
+
         if mode == "vocal":
             st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
 
-        st.caption(f"Messages en mémoire: {len(st.session_state.get('messages', []))}")
-
-        # --- Live pump ---
+        # Pompe live des logs si Jarvis tourne
         if st.session_state.get("jarvis_running"):
             mode = st.session_state.get("interaction_mode", "chat")
             idle_timeout = 120.0 if mode == "vocal" else 6.0
@@ -2155,4 +2221,3 @@ with tab_settings:
                 st.cache_data.clear()
                 st.rerun()
 
-# (SUPPRIMÉ) Auto-refresh forcé via st.rerun en boucle — remplacé par la pompe live ci-dessus.
