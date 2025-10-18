@@ -242,7 +242,6 @@ def _build_ollama_chat_messages(messages):
         if role not in ("user", "assistant", "system", "tool"):
             role = "assistant" if role != "user" else "user"
         obj = {"role": role, "content": content}
-        # si le message inclut des champs avancés (tool_calls/thinking) on les garde
         for k in ("tool_calls", "thinking", "tool_name"):
             if k in m:
                 obj[k] = m[k]
@@ -316,7 +315,6 @@ def ollama_stream_chat(cfg: Dict[str, Any], messages: List[Dict[str, Any]], on_d
                 obj = json.loads(line)
             except Exception:
                 continue
-            # Ollama envoie {message:{content:"..."}, done:bool, ...}
             chunk = (((obj.get("message") or {}).get("content")) or "")
             if chunk:
                 buf.append(chunk)
@@ -502,13 +500,213 @@ def mcp_call_tool_via_gateway(tool: str, arguments: Dict[str, Any], timeout_s: i
                     return _fmt_call_result(res)
         return asyncio.run(_go_sse())
 
-# ---------- DDG helpers (via Gateway) ----------
-def ddg_search(query: str, topk: int = 5) -> str:
-    """Recherche DDG via le Gateway (tool: ddg__search)."""
+# ----- Récupération "raw" d'un tool (structuredContent + textes) -----
+def _mcp_call_tool_raw(tool: str, arguments: Dict[str, Any], timeout_s: int = 60) -> Tuple[Any, List[str]]:
+    gw = _mcp_gateway_cfg()
+    base = (gw.get("base_url", "") or "").rstrip("/")
+    headers = {"Authorization": gw["auth_header"]} if gw.get("auth_header") else {}
+
     try:
-        args = {"query": query, "max_results": int(topk)}
-        out = mcp_call_tool_via_gateway("ddg__search", args, timeout_s=60)
-        return out or "(vide)"
+        from mcp import ClientSession, types as _t
+        from mcp.client.streamable_http import streamablehttp_client
+
+        async def _go():
+            async with streamablehttp_client(f"{base}/mcp", headers=headers) as (r, w, _):
+                async with ClientSession(r, w) as sess:
+                    await sess.initialize()
+                    res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
+                    sc = getattr(res, "structuredContent", None)
+                    texts: List[str] = []
+                    for c in getattr(res, "content", []) or []:
+                        if isinstance(c, _t.TextContent):
+                            texts.append(c.text)
+                        elif isinstance(c, _t.EmbeddedResource):
+                            uri = getattr(c.resource, "uri", "")
+                            if uri:
+                                texts.append(uri)
+                    return sc, texts
+
+        return asyncio.run(_go())
+
+    except Exception:
+        # Fallback SSE
+        try:
+            from mcp import ClientSession, types as _t
+            from mcp.client.sse import sse_client
+
+            async def _go_sse():
+                async with sse_client(f"{base}/sse", headers=headers) as (r, w):
+                    async with ClientSession(r, w) as sess:
+                        await sess.initialize()
+                        res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
+                        sc = getattr(res, "structuredContent", None)
+                        texts: List[str] = []
+                        for c in getattr(res, "content", []) or []:
+                            if isinstance(c, _t.TextContent):
+                                texts.append(c.text)
+                            elif isinstance(c, _t.EmbeddedResource):
+                                uri = getattr(c.resource, "uri", "")
+                                if uri:
+                                    texts.append(uri)
+                        return sc, texts
+
+            return asyncio.run(_go_sse())
+        except Exception:
+            return None, []
+
+# ----- Parcours générique et fix placeholders (nouveau helper) -----
+def _walk_find_result_items(obj) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    if isinstance(obj, dict):
+        if any(k in obj for k in ("url", "href", "link")):
+            items.append(obj)
+        for v in obj.values():
+            items += _walk_find_result_items(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            items += _walk_find_result_items(it)
+    return items
+
+def _fix_placeholder_urls(items: List[Dict[str, Any]], url_candidates: List[str]) -> List[Dict[str, Any]]:
+    """
+    Si un item a 'url' (ou href/link) = '\1'/'\2'/... ou vide, on remappe :
+      - si des indices différents sont présents -> mapping par indice
+      - sinon -> mapping séquentiel (1er item -> 1ère URL, etc.)
+    """
+    # collecte des placeholders présents
+    placeholders = []
+    for it in items:
+        url = it.get("url") or it.get("href") or it.get("link") or ""
+        m = re.fullmatch(r"\s*\\([0-9]+)\s*", str(url))
+        placeholders.append(int(m.group(1)) if m else None)
+
+    if any(p is not None for p in placeholders):
+        uniq = {p for p in placeholders if p is not None}
+        fixed = []
+        if len(uniq) > 1:
+            # mapping par indice
+            for i, it in enumerate(items):
+                new = dict(it)
+                url = new.get("url") or new.get("href") or new.get("link") or ""
+                m = re.fullmatch(r"\s*\\([0-9]+)\s*", str(url))
+                if m:
+                    idx = int(m.group(1))
+                    val = url_candidates[idx-1] if 1 <= idx <= len(url_candidates) else ""
+                    if "url" in new:
+                        new["url"] = val
+                    elif "href" in new:
+                        new["href"] = val
+                    else:
+                        new["link"] = val
+                fixed.append(new)
+            return fixed
+        else:
+            # mapping séquentiel
+            fixed = []
+            for i, it in enumerate(items):
+                new = dict(it)
+                url = new.get("url") or new.get("href") or new.get("link") or ""
+                if (not url) or re.fullmatch(r"\s*\\[0-9]+\s*", str(url)):
+                    val = url_candidates[i] if i < len(url_candidates) else ""
+                    if "url" in new:
+                        new["url"] = val
+                    elif "href" in new:
+                        new["href"] = val
+                    else:
+                        new["link"] = val
+                fixed.append(new)
+            return fixed
+    return items
+
+def _format_ddg_items(items: List[Dict[str, Any]], max_items: int) -> str:
+    out_lines = []
+    for i, it in enumerate(items[:max_items], 1):
+        title = it.get("title") or it.get("name") or it.get("text") or it.get("heading") \
+                or (it.get("url") or it.get("href") or it.get("link") or "")
+        url = it.get("url") or it.get("href") or it.get("link") or ""
+        summary = it.get("snippet") or it.get("summary") or it.get("description") or it.get("body") or ""
+        block = f"{i}. {title}\n   URL: {url}\n   Summary: {summary}".rstrip()
+        out_lines.append(block)
+    return "\n\n".join(out_lines) if out_lines else "(aucun résultat)"
+    
+# ----- Helpers URLs (mis à jour) -----
+def _extract_http_urls_from_texts(texts: List[str]) -> List[str]:
+    urls: List[str] = []
+    for t in texts or []:
+        for u in re.findall(r"https?://[^\s<>\]\"')]+", t):
+            urls.append(u)
+    # dédup en conservant l'ordre
+    seen = set()
+    ordered = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    return ordered
+
+def _replace_backref_urls(raw: str, urls: List[str]) -> str:
+    """
+    Remplace 'URL: \\1', 'URL:\\2', etc. par de vraies URLs.
+    - Si indices variés -> mapping par indice (1-based).
+    - Si tous identiques (souvent '\\1') -> mapping séquentiel (1er, 2e, 3e...).
+    """
+    indices = re.findall(r"URL:\s*\\([0-9]+)", raw)
+    if not indices:
+        # Edge: quelques outils émettent un caractère de contrôle au lieu de '\1'
+        raw = re.sub(r"URL:\s*[\x00-\x1f]", "URL: (non fourni)", raw)
+        return raw
+
+    uniq = set(indices)
+    if len(uniq) > 1:
+        def repl(m):
+            idx = int(m.group(1))
+            if 1 <= idx <= len(urls):
+                return f"URL: {urls[idx-1]}"
+            return "URL: (non fourni)"
+        raw = re.sub(r"URL:\s*\\([0-9]+)", repl, raw)
+    else:
+        it = iter(urls)
+        def repl_seq(_):
+            try:
+                return f"URL: {next(it)}"
+            except StopIteration:
+                return "URL: (non fourni)"
+        raw = re.sub(r"URL:\s*\\[0-9]+", repl_seq, raw)
+
+    # Nettoyage final si des restes subsistent
+    raw = re.sub(r"URL:\s*\\[0-9]+", "URL: (non fourni)", raw)
+    raw = re.sub(r"URL:\s*[\x00-\x1f]", "URL: (non fourni)", raw)
+    return raw
+
+def _cleanup_found_header(raw: str) -> str:
+    return re.sub(r"^\s*Found\s+\d+\s+search\s+results:\s*\n?", "", raw, flags=re.IGNORECASE|re.MULTILINE)
+
+def ddg_search(query: str, topk: int = 5) -> str:
+    """
+    Version 'pretty' : essaie d'utiliser le JSON structuré du tool DDG,
+    corrige les URLs placeholder (\1, \2, ... ou toutes '\1') grâce aux ressources,
+    puis fallback robuste sur le texte brut.
+    """
+    try:
+        sc, texts = _mcp_call_tool_raw("ddg__search", {"query": query, "max_results": int(topk)}, timeout_s=60)
+        url_candidates = _extract_http_urls_from_texts(texts)
+
+        # 1) JSON structuré exploitable
+        if isinstance(sc, (dict, list)):
+            items = _walk_find_result_items(sc)
+            if items:
+                items = _fix_placeholder_urls(items, url_candidates)
+                return _format_ddg_items(items, max_items=int(topk))
+
+        # 2) Fallback texte brut + remplacement
+        raw = "\n".join(texts) if texts else mcp_call_tool_via_gateway(
+            "ddg__search", {"query": query, "max_results": int(topk)}, timeout_s=60
+        )
+        raw = raw or "(vide)"
+        raw = _replace_backref_urls(raw, url_candidates)
+        raw = _cleanup_found_header(raw)
+        return raw
+
     except Exception as e:
         return f"[MCP/ddg__search] {e}"
 
@@ -568,10 +766,10 @@ def maybe_run_tool_and_answer(cfg: Dict[str, Any], msgs: List[Dict[str, str]], l
         if not tool_name:
             break
         used_any_tool = True
-        msgs.append({"role": "assistant", "content": f"[Agent] Appel outil demandé : {tool_name} {json.dumps(args, ensure_ascii=False)}"})
+        msgs.append({"role": "system", "content": f"[Agent] Appel outil demandé : {tool_name} {json.dumps(args, ensure_ascii=False)}"})
         out = mcp_call_tool_via_gateway(tool_name, args, timeout_s=90)
-        msgs.append({"role": "assistant", "content": f"[Résultat outil: {tool_name}]\n{out}"})
-        msgs.append({"role": "user", "content": "À partir du résultat d’outil ci-dessus, réponds brièvement en français et cite les URLs si pertinentes."})
+        msgs.append({"role": "system", "content": f"[Résultat outil: {tool_name}]\n{out}"})
+        msgs.append({"role": "system", "content": "À partir du résultat d’outil ci-dessus, réponds brièvement en français et cite les URLs si pertinentes."})
         current_reply = ollama_reply(cfg, msgs)
 
     if used_any_tool:
@@ -591,7 +789,6 @@ def build_ollama_tools_from_mcp() -> List[Dict[str, Any]]:
             continue
         desc = t.get("description") or ""
         schema = t.get("inputSchema") or {}
-        # Schéma JSON MCP ~ JSON Schema → directement mappé dans "parameters"
         tool = {
             "type": "function",
             "function": {
@@ -611,6 +808,7 @@ def chat_with_tools_agent(cfg: Dict[str, Any], user_text: str, ui_msgs: List[Dic
       - Exécute chaque tool_call via MCP puis renvoie les résultats (role='tool')
       - Reboucle jusqu’à absence de tool_calls ou max_rounds atteint
     Retourne la réponse finale (texte) ou None si échec.
+    NOTE: ui_msgs sert de buffer de traces (role='system'), invisible côté UI.
     """
     if not cfg.get("llm", {}).get("use_ollama_tools", True):
         return None
@@ -629,7 +827,6 @@ def chat_with_tools_agent(cfg: Dict[str, Any], user_text: str, ui_msgs: List[Dic
         "num_ctx": int(cfg["ollama"].get("num_ctx", 4096)),
     }
 
-    # Fil de conversation minimal pour l’agent
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": (cfg.get("llm", {}).get("system_prompt") or "You are Jarvis.")},
         {"role": "user", "content": user_text},
@@ -645,46 +842,38 @@ def chat_with_tools_agent(cfg: Dict[str, Any], user_text: str, ui_msgs: List[Dic
             "tools": tools,
             "stream": False,
             "options": options,
-            # "think": False,
         }
         try:
             r = requests.post(url, json=payload, timeout=180)
             r.raise_for_status()
             data = r.json() or {}
         except Exception as e:
-            ui_msgs.append({"role": "assistant", "content": f"[Agent] Erreur appel Ollama: {e}"})
+            ui_msgs.append({"role": "system", "content": f"[Agent] Erreur appel Ollama: {e}"})
             return None
 
         msg = (data.get("message") or {})
-        # Conserver la trace assistant (peut inclure du contenu et/ou des tool_calls)
         messages.append(msg)
 
-        # Si le modèle a déjà donné une réponse finale SANS tool_calls, on sort
         tool_calls = msg.get("tool_calls") or []
         content = (msg.get("content") or "").strip()
 
         if tool_calls:
-            # Exécuter les outils demandés
             for call in tool_calls:
                 fn = (call.get("function") or {})
                 tname = str(fn.get("name") or "").strip()
                 targs = fn.get("arguments") or {}
-                ui_msgs.append({"role": "assistant", "content": f"[Agent] Appel tool: {tname} args={json.dumps(targs, ensure_ascii=False)}"})
+                ui_msgs.append({"role": "system", "content": f"[Agent] Appel tool: {tname} args={json.dumps(targs, ensure_ascii=False)}"})
                 try:
                     result = mcp_call_tool_via_gateway(tname, targs, timeout_s=90)
                 except Exception as e:
                     result = f"[MCP] Erreur exécution tool {tname}: {e}"
-                # Ajoute la réponse du tool (role='tool') pour le prochain tour
                 messages.append({"role": "tool", "tool_name": tname, "content": str(result)})
-                ui_msgs.append({"role": "assistant", "content": f"[Résultat tool {tname}]\n{(str(result) or '(vide)')[:8000]}"})
-            # Boucle et renvoyer la réponse finale après avoir ajouté les messages 'tool'
+                ui_msgs.append({"role": "system", "content": f"[Résultat tool {tname}]\n{(str(result) or '(vide)')[:8000]}"})
             continue
 
-        # Pas de tool_calls → la réponse actuelle est finale
         final_answer = content or ""
         break
 
-    # Si on a une réponse finale vide, tenter un fallback simple
     if final_answer is None:
         final_answer = content or ""
 
@@ -711,10 +900,8 @@ if "assistant_vu_history" not in st.session_state:
     st.session_state.assistant_vu_history = []
 if "mode_toggle" not in st.session_state:
     st.session_state.mode_toggle = False
-# (SUPPRIMÉ) auto_refresh_chat: plus utilisé
 
 def _set_interaction_mode(mode: str):
-    """Définit le mode d'interaction (vocal ou chat)."""
     mode = "vocal" if mode == "vocal" else "chat"
     if mode != st.session_state.interaction_mode and mode == "vocal":
         st.session_state["chat_input"] = ""
@@ -722,14 +909,12 @@ def _set_interaction_mode(mode: str):
     st.session_state.mode_toggle = mode == "vocal"
 
 def _sync_mode_from_toggle():
-    """Synchronise le mode depuis le toggle."""
     desired = "vocal" if st.session_state.get("mode_toggle") else "chat"
     _set_interaction_mode(desired)
 
 _set_interaction_mode(st.session_state.interaction_mode)
 
 def _load_jarvis_module(path: str):
-    """Charge le module jarvis.py."""
     spec = importlib.util.spec_from_file_location("jarvis", path)
     if not spec or not spec.loader:
         raise RuntimeError("Impossible de charger jarvis.py")
@@ -738,7 +923,6 @@ def _load_jarvis_module(path: str):
     return mod
 
 def start_jarvis(cfg: Dict[str, Any]):
-    """Démarre Jarvis en arrière-plan."""
     if st.session_state.jarvis_running:
         st.warning("Jarvis tourne déjà.")
         return
@@ -775,7 +959,6 @@ def start_jarvis(cfg: Dict[str, Any]):
         st.error(f"Erreur au démarrage de Jarvis: {e}")
 
 def stop_jarvis():
-    """Arrête Jarvis."""
     if not st.session_state.jarvis_running or not st.session_state.jarvis_mod:
         st.info("Jarvis n'est pas en cours.")
         return
@@ -786,7 +969,6 @@ def stop_jarvis():
         st.error(f"Stop error: {e}")
 
 def drain_jarvis_logs(max_keep: int = 800) -> List[str]:
-    """Vide la queue de logs de Jarvis."""
     jm = st.session_state.jarvis_mod
     if not jm or not hasattr(jm, "q_log"):
         return []
@@ -808,7 +990,6 @@ def drain_jarvis_logs(max_keep: int = 800) -> List[str]:
     return pulled
 
 def _update_speaking_state_from_logs(logs: List[str]):
-    """Met à jour l'état parlant depuis les logs."""
     if not logs:
         return
     now = time.time()
@@ -845,14 +1026,11 @@ def _update_speaking_state_from_logs(logs: List[str]):
     st.session_state.assistant_speaking = speaking
 
 # ---------- Ingestion chat : NOUVELLE VERSION ----------
-# Préfixes reconnus
 CHAT_PREFIX_USER = re.compile(r'^\[(?:STT|VOICE)\]\s*(?:Vous|You)\s*:\s*(.+)$', re.IGNORECASE)
 CHAT_PREFIX_ASSISTANT = re.compile(r'^(?:JARVIS|Assistant)\s*:\s*(.+)$', re.IGNORECASE)
-# Tout log technique qui commence par [TAG] (ferme l’agrégation assistant)
 NON_CHAT_PREFIX = re.compile(r'^\[(?:VU|AUDIO|TTS|LLM|BG|INFO|WARN|ERR|DEBUG|MCP)\]', re.IGNORECASE)
 
 def _append_assistant_line(messages: List[Dict[str, str]], text: str) -> None:
-    """Concatène 'text' à la dernière bulle assistant, ou crée une nouvelle bulle."""
     text = "" if text is None else str(text)
     if messages and messages[-1].get("role") == "assistant":
         prev = messages[-1]["content"]
@@ -862,10 +1040,6 @@ def _append_assistant_line(messages: List[Dict[str, str]], text: str) -> None:
         messages.append({"role": "assistant", "content": text.rstrip()})
 
 def _ingest_chat_from_logs(logs: List[str], *, rerun: bool = True):
-    """
-    Ingère les messages chat depuis les logs + agrège toutes les lignes après 'JARVIS:'.
-    Ferme l'agrégation si un nouveau préfixe de log [TAG] apparaît ou si un message user arrive.
-    """
     if not logs:
         return
     msgs = st.session_state.setdefault("messages", [])
@@ -903,7 +1077,6 @@ def _ingest_chat_from_logs(logs: List[str], *, rerun: bool = True):
         if assembling:
             _append_assistant_line(msgs, line)
             changed = True
-        # sinon: bruit, on ignore
 
     st.session_state["_assembling_assistant"] = assembling
     if changed:
@@ -912,48 +1085,56 @@ def _ingest_chat_from_logs(logs: List[str], *, rerun: bool = True):
             st.rerun()
 
 # ---------- Orchestration message (chat & voix) ----------
-def process_user_text(clean_text: str, origin: str = "chat"):
+def process_user_text(clean_text: str, origin: str = "chat", already_appended: bool = False):
     """
-    Pipeline unique : prend la demande utilisateur (chat/voix),
-    (0) essaie l’agent Tool-Calling natif ; sinon (1) applique raccourcis/auto-web ; sinon (2) LLM pur.
+    Orchestrateur des réponses.
+    - already_appended=True si le message utilisateur a déjà été poussé dans st.session_state['messages']
+      (pour afficher tout de suite la bulle utilisateur + un placeholder '…' avant les appels réseau).
+    - Les contextes (DDG, traces agent) sont injectés comme role='system' (non affichés dans l'UI).
     """
     msgs = st.session_state.setdefault("messages", [])
+    agent_trace = st.session_state.setdefault("agent_trace", [])
     gw = CFG.get("mcp", {}).get("gateway", {})
     used_gateway = False
 
-    # --- (0) Tool-calling natif Ollama en priorité
+    # Ajouter le message user si pas déjà ajouté par le handler d'UI
+    if not already_appended:
+        msgs.append({"role": "user", "content": clean_text})
+
+    # (0) Tool-calling natif (si dispo)
     if CFG.get("llm", {}).get("use_ollama_tools", True):
-        msgs.append({"role":"user","content":clean_text})
-        final = chat_with_tools_agent(CFG, clean_text, msgs)
+        final = chat_with_tools_agent(CFG, clean_text, agent_trace)
         if isinstance(final, str) and final.strip():
-            msgs.append({"role":"assistant","content": final})
+            msgs.append({"role": "assistant", "content": final})
             st.session_state["messages"] = msgs[-200:]
             st.session_state.last_assistant_ts = time.time()
             st.session_state.assistant_speaking = True
             return
-        # sinon: on continue (raccourcis/auto-web/LLM pur)
 
-    # (1) Raccourcis en mode chat
+    # (1) Raccourcis (/web, /fetch, /tool) — AFFICHAGE DIRECT des résultats (pas de résumé)
     if origin == "chat" and gw.get("chat_shortcuts", True) and gw.get("enabled", True):
-        m_ddg = re.match(r"^/(?:web|ddg)\s+(.+)$", clean_text, flags=re.IGNORECASE)
+        m_ddg  = re.match(r"^/(?:web|ddg)\s+(.+)$", clean_text, flags=re.IGNORECASE)
         m_fetch = re.match(r"^/fetch\s+(\S+)$", clean_text, flags=re.IGNORECASE)
         m_tool  = re.match(r"^/tool\s+([A-Za-z0-9_.:\-]+)\s*(.*)$", clean_text)
+
         if m_ddg:
             query = m_ddg.group(1).strip()
-            msgs.append({"role":"user","content":clean_text})
-            ctx = f"[WEB/DDG] Résultats pour: {query}\n{ddg_search(query, topk=int(gw.get('auto_web_topk',5)))}\n\n"
-            msgs.append({"role":"assistant","content":ctx})
-            msgs.append({"role":"user","content":"Sur la base du contexte web ci-dessus, réponds de façon concise."})
-            reply = ollama_reply(CFG, msgs)
-            final = maybe_run_tool_and_answer(CFG, msgs, reply)
-            if final is None:
-                msgs.append({"role":"assistant","content": reply or "(réponse vide)"})
-            used_gateway = True
+            pretty = ddg_search(query, topk=int(gw.get('auto_web_topk',5)))
+            msgs.append({"role": "assistant", "content": f"🔎 Résultats pour « {query} »\n\n{pretty}"})
+            st.session_state["messages"] = msgs[-200:]
+            st.session_state.last_assistant_ts = time.time()
+            st.session_state.assistant_speaking = True
+            return
+
         elif m_fetch:
             url = m_fetch.group(1).strip()
-            msgs.append({"role":"user","content":clean_text})
-            msgs.append({"role":"assistant","content": ddg_fetch(url)})
-            used_gateway = True
+            out = ddg_fetch(url)
+            msgs.append({"role": "assistant", "content": out})
+            st.session_state["messages"] = msgs[-200:]
+            st.session_state.last_assistant_ts = time.time()
+            st.session_state.assistant_speaking = True
+            return
+
         elif m_tool:
             tool_name = m_tool.group(1)
             arg_str   = (m_tool.group(2) or "").strip()
@@ -968,32 +1149,34 @@ def process_user_text(clean_text: str, origin: str = "chat"):
                             args[k] = v
             except Exception as e:
                 args = {}
-                msgs.append({"role":"assistant","content": f"[MCP] Args invalides: {e}"})
-            msgs.append({"role":"user","content":clean_text})
+                msgs.append({"role": "assistant", "content": f"[MCP] Args invalides: {e}"})
+                st.session_state["messages"] = msgs[-200:]
+                st.session_state.last_assistant_ts = time.time()
+                st.session_state.assistant_speaking = True
+                return
+
             out = mcp_call_tool_via_gateway(tool_name, args, timeout_s=60)
-            msgs.append({"role":"assistant","content": out or "(vide)"})
-            used_gateway = True
+            msgs.append({"role": "assistant", "content": out or "(vide)"})
+            st.session_state["messages"] = msgs[-200:]
+            st.session_state.last_assistant_ts = time.time()
+            st.session_state.assistant_speaking = True
+            return
 
-    # (2) Auto-web si activé ET pas déjà utilisé
+    # (2) Auto-web (si activé) — AFFICHAGE DIRECT 'pretty'
     if gw.get("enabled", True) and gw.get("auto_web", False) and not used_gateway:
-        msgs.append({"role":"user","content":clean_text})
-        search_out = ddg_search(clean_text, topk=int(gw.get("auto_web_topk", 5)))
-        ctx = f"[WEB/DDG:auto] Résultats bruts:\n{search_out}\n\n"
-        msgs.append({"role":"assistant","content":ctx})
-        msgs.append({"role":"user","content":"Utilise le contexte DDG ci-dessus pour répondre brièvement."})
-        reply = ollama_reply(CFG, msgs)
-        final = maybe_run_tool_and_answer(CFG, msgs, reply)
-        if final is None:
-            msgs.append({"role":"assistant","content": reply or "(réponse vide)"})
-        used_gateway = True
+        pretty = ddg_search(clean_text, topk=int(gw.get("auto_web_topk", 5)))
+        msgs.append({"role": "assistant", "content": f"🔎 Résultats (auto) pour « {clean_text} »\n\n{pretty}"})
+        st.session_state["messages"] = msgs[-200:]
+        st.session_state.last_assistant_ts = time.time()
+        st.session_state.assistant_speaking = True
+        return
 
-    # (3) LLM pur (+ agent legacy éventuel)
+    # (3) LLM pur
     if not used_gateway:
-        msgs.append({"role":"user","content":clean_text})
         reply = ollama_reply(CFG, msgs)
         final = maybe_run_tool_and_answer(CFG, msgs, reply)
         if final is None:
-            msgs.append({"role":"assistant","content": reply or "Réponse vide d'Ollama (vérifie le modèle)."})
+            msgs.append({"role": "assistant", "content": reply or "Réponse vide d'Ollama (vérifie le modèle)."})
 
     st.session_state["messages"] = msgs[-200:]
     st.session_state.last_assistant_ts = time.time()
@@ -1081,7 +1264,6 @@ def _pill_html(name: str, ok: bool, label: str) -> str:
 ollama_up = is_ollama_up(CFG["ollama"]["host"])
 ollama_status = "Up" if ollama_up else "Down"
 
-# Statut MCP: simple (activé ?), libellé = host
 gw = CFG.get("mcp", {}).get("gateway", {})
 mcp_ok = bool(gw.get("enabled", False))
 mcp_host_label = gw.get("base_url", "") or "off"
@@ -1095,7 +1277,6 @@ voice_path = _maybe_join_voice(CFG["piper"].get("base_dir", ""), CFG["piper"].ge
 piper_ok = jarvis_running and CFG["jarvis"].get("tts_engine") == "piper" and voice_path and os.path.exists(voice_path)
 piper_label = "Ready" if piper_ok else "Off"
 
-# ORT (ONNX Runtime) status
 ort_provs, ort_label = _ort_providers()
 ort_ok = bool(ort_provs)
 pill_ort = _pill_html("ONNXRT", ort_ok, ort_label)
@@ -1216,9 +1397,6 @@ def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]
             <circle cx="150" cy="150" r="105" fill="none" stroke="#00d4e8" stroke-width="1" opacity="0.25"/>
             <circle cx="150" cy="150" r="70"  fill="none" stroke="#00d4e8" stroke-width="1.5" opacity="0.35"/>
             <circle cx="150" cy="150" r="35"  fill="none" stroke="#00d4e8" stroke-width="1" opacity="0.3"/>
-
-            <line x1="10"  y1="150" x2="290" y2="150" stroke="#00d4e8" stroke-width="1" opacity="0.2"/>
-            <line x1="150" y1="10"  x2="150" y2="290" stroke="#00d4e8" stroke-width="1" opacity="0.2"/>
 
             <g id="waves">
               <circle class="wave wave-1" cx="150" cy="150" r="35"/>
@@ -1345,6 +1523,7 @@ def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]
 
             const attrSpeaking = svg.classList.contains('speaking');
             const speakingNow = attrSpeaking || smoothedLevel > 0.04;
+
             if (speakingNow !== speaking) {{
               speaking = speakingNow;
               container.setAttribute('data-speaking', String(speaking));
@@ -1364,8 +1543,6 @@ def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]
             }}
 
             const visualLevel = smoothedLevel > 0.015 ? smoothedLevel : (speakingNow ? 0.12 : 0);
-            container.dataset.level = visualLevel.toFixed(3);
-
             const cycleMs = speakingNow ? BASE_CYCLE_MS * (1 - Math.min(visualLevel, 0.6) * 0.35) : BASE_CYCLE_MS * 1.1;
 
             waves.forEach((wave, index) => {{
@@ -1414,7 +1591,6 @@ with tab_interface:
 
     c1, c2 = st.columns([5, 7])
     with c1:
-        # Radar
         render_radar(
             speaking=speaking,
             mode=mode,
@@ -1424,21 +1600,26 @@ with tab_interface:
     with c2:
         msgs = st.session_state.setdefault("messages", [])
 
+        # ---- Rendu du chat : on n'affiche QUE user/assistant (on masque system/tool)
+        # ---- ET on rend cliquables les URLs.
         def _render_messages(messages: List[Dict[str, str]]) -> str:
-            if not messages:
+            display = [m for m in (messages or []) if m.get("role") in ("user", "assistant")]
+            if not display:
                 return (
-                    '<div class="msgs"><div class="bubble assistant muted">'
+                    '<div class="msgs" id="chatMsgs"><div class="bubble assistant muted">'
                     "Aucun échange pour le moment."
                     "</div></div>"
                 )
             bubbles = []
-            for msg in messages:
+            for msg in display:
                 role = msg.get("role", "assistant")
                 content = msg.get("content", "")
                 cls = "bubble assistant" if role != "user" else "bubble user"
-                safe_content = html.escape(str(content)).replace("\n", "<br />")
+                safe_content = html.escape(str(content))
+                safe_content = re.sub(r'(https?://[^\s<]+)', r'<a href="\\1" target="_blank">\\1</a>', safe_content)
+                safe_content = safe_content.replace("\n", "<br />")
                 bubbles.append(f'<div class="{cls}">{safe_content}</div>')
-            return f"<div class='msgs'>{''.join(bubbles)}</div>"
+            return f"<div class='msgs' id='chatMsgs'>{''.join(bubbles)}</div>"
 
         chat_slot = st.empty()
         chat_slot.markdown(
@@ -1476,9 +1657,6 @@ with tab_interface:
                 help="Expose tous tes tools via un endpoint unique."
             )
             st.caption("Raccourci chat: `/tool <nom> {json}`  → appelle le tool via le gateway.")
-
-            # (SUPPRIMÉ) bloc Auto-refresh inutile
-
             st.markdown('</div>', unsafe_allow_html=True)
 
         mode = st.session_state.interaction_mode
@@ -1510,9 +1688,29 @@ with tab_interface:
             if submitted and mode == "chat":
                 clean_text = (user_text or "").strip()
                 if clean_text:
-                    # Si streaming Ollama activé ET tool-calling natif désactivé, on stream la réponse.
-                    if bool(CFG["ollama"].get("stream")) and not bool(CFG["llm"].get("use_ollama_tools", True)):
-                        st.session_state["messages"].append({"role": "user", "content": clean_text})
+                    # 1) Afficher immédiatement le message user + un placeholder assistant "…"
+                    st.session_state["messages"].append({"role": "user", "content": clean_text})
+
+                    # Choix du streaming
+                    use_stream = bool(CFG["ollama"].get("stream")) and not bool(CFG["llm"].get("use_ollama_tools", True))
+                    if not use_stream:
+                        st.session_state["messages"].append({"role": "assistant", "content": "…"})
+                        chat_slot.markdown(
+                            f'''
+                            <div class="card chat-card">
+                              <div class="chat-card-body">
+                                <h3>Chat</h3>
+                                <div class="chat-wrap">
+                                  {_render_messages(st.session_state["messages"][-200:])}
+                                </div>
+                              </div>
+                            </div>
+                            ''',
+                            unsafe_allow_html=True
+                        )
+
+                    if use_stream:
+                        # 2A) Mode streaming (sans tools) : on construit la réponse en direct
                         st.session_state["messages"].append({"role": "assistant", "content": ""})
 
                         def _on_delta(tok: str):
@@ -1534,39 +1732,48 @@ with tab_interface:
 
                         try:
                             _apply_env_from_cfg(CFG)
-                            # On utilise uniquement les 20 derniers messages pour le contexte
                             ctx_msgs = st.session_state["messages"][-20:]
                             _ = ollama_stream_chat(CFG, ctx_msgs, _on_delta)
                         except Exception as e:
                             st.session_state["messages"][-1]["content"] = f"(Erreur stream Ollama: {e})"
+
                     else:
-                        # Flux complet avec tools/auto-web/etc.
-                        process_user_text(clean_text, origin="chat")
-                        # Repeindre le chat sans relancer l'app
+                        # 2B) Traitement normal (tools/auto-web/LLM) — le message user est déjà ajouté
+                        process_user_text(clean_text, origin="chat", already_appended=True)
+
+                        # 3) Retirer le placeholder "…" s'il est toujours là
                         msgs_now = st.session_state.get("messages", [])
-                        chat_slot.markdown(
-                            f'''
-                            <div class="card chat-card">
-                              <div class="chat-card-body">
-                                <h3>Chat</h3>
-                                <div class="chat-wrap">
-                                  {_render_messages(msgs_now)}
-                                </div>
-                              </div>
+                        for i in range(len(msgs_now)-1, -1, -1):
+                            if msgs_now[i].get("role") == "assistant" and msgs_now[i].get("content") == "…":
+                                msgs_now.pop(i)
+                                break
+                        st.session_state["messages"] = msgs_now
+
+                    # 4) Repeindre le chat
+                    chat_slot.markdown(
+                        f'''
+                        <div class="card chat-card">
+                          <div class="chat-card-body">
+                            <h3>Chat</h3>
+                            <div class="chat-wrap">
+                              {_render_messages(st.session_state["messages"][-200:])}
                             </div>
-                            ''',
-                            unsafe_allow_html=True
-                        )
+                          </div>
+                        </div>
+                        ''',
+                        unsafe_allow_html=True
+                    )
 
         if mode == "vocal":
             st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
 
         st.caption(f"Messages en mémoire: {len(st.session_state.get('messages', []))}")
 
-        # --- Live pump (voix & logs backend) : mise à jour temps réel SANS bouton, SANS st.rerun ---
-        if st.session_state.get("jarvis_running") and (st.session_state.get("interaction_mode") == "vocal"):
-            idle_timeout = 120.0   # [MODIF] la pompe reste active plus longtemps (2 min d’inactivité)
-            poll_interval = 0.10   # [MODIF] latence visuelle ~100 ms
+        # --- Live pump ---
+        if st.session_state.get("jarvis_running"):
+            mode = st.session_state.get("interaction_mode", "chat")
+            idle_timeout = 120.0 if mode == "vocal" else 6.0
+            poll_interval = 0.10 if mode == "vocal" else 0.15
             last_activity = time.time()
 
             while True:
@@ -1576,7 +1783,6 @@ with tab_interface:
                     _ingest_chat_from_logs(logs, rerun=False)
                     last_activity = time.time()
 
-                    # Repeindre le chat sans relancer le script
                     msgs_live = st.session_state.get("messages", [])
                     chat_slot.markdown(
                         f'''
@@ -1592,8 +1798,10 @@ with tab_interface:
                         unsafe_allow_html=True
                     )
 
-                if time.time() - last_activity > idle_timeout:
+                assembling = bool(st.session_state.get("_assembling_assistant", False))
+                if (time.time() - last_activity > idle_timeout) and not assembling:
                     break
+
                 time.sleep(poll_interval)
 
 # -------------------- Settings --------------------
@@ -1854,7 +2062,6 @@ with tab_settings:
                 try:
                     tools = mcp_list_tools_full_via_gateway()
                     if tools:
-                        # aperçu compact
                         preview = "\n".join([f"- {t['name']}: {t.get('description','')}" for t in tools])
                         st.success(preview[:3000] if len(preview) > 3000 else preview)
                     else:
