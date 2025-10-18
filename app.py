@@ -645,25 +645,16 @@ def _extract_http_urls_from_texts(texts: List[str]) -> List[str]:
     return ordered
 
 def _replace_backref_urls(raw: str, urls: List[str]) -> str:
-    """
-    Remplace 'URL: \\1', 'URL:\\2', etc. par de vraies URLs.
-    - Si indices variés -> mapping par indice (1-based).
-    - Si tous identiques (souvent '\\1') -> mapping séquentiel (1er, 2e, 3e...).
-    """
-    indices = re.findall(r"URL:\s*\\([0-9]+)", raw)
+    indices = re.findall(r"URL:\s*\\([0-9]+)", raw, flags=re.IGNORECASE)
     if not indices:
-        # Edge: quelques outils émettent un caractère de contrôle au lieu de '\1'
-        raw = re.sub(r"URL:\s*[\x00-\x1f]", "URL: (non fourni)", raw)
+        raw = re.sub(r"URL:\s*[\x00-\x1f]", "URL: (non fourni)", raw, flags=re.IGNORECASE)
         return raw
 
-    uniq = set(indices)
-    if len(uniq) > 1:
+    if len(set(indices)) > 1:
         def repl(m):
             idx = int(m.group(1))
-            if 1 <= idx <= len(urls):
-                return f"URL: {urls[idx-1]}"
-            return "URL: (non fourni)"
-        raw = re.sub(r"URL:\s*\\([0-9]+)", repl, raw)
+            return f"URL: {urls[idx-1]}" if 1 <= idx <= len(urls) else "URL: (non fourni)"
+        raw = re.sub(r"URL:\s*\\([0-9]+)", repl, raw, flags=re.IGNORECASE)
     else:
         it = iter(urls)
         def repl_seq(_):
@@ -671,22 +662,16 @@ def _replace_backref_urls(raw: str, urls: List[str]) -> str:
                 return f"URL: {next(it)}"
             except StopIteration:
                 return "URL: (non fourni)"
-        raw = re.sub(r"URL:\s*\\[0-9]+", repl_seq, raw)
+        raw = re.sub(r"URL:\s*\\[0-9]+", repl_seq, raw, flags=re.IGNORECASE)
 
-    # Nettoyage final si des restes subsistent
-    raw = re.sub(r"URL:\s*\\[0-9]+", "URL: (non fourni)", raw)
-    raw = re.sub(r"URL:\s*[\x00-\x1f]", "URL: (non fourni)", raw)
+    raw = re.sub(r"URL:\s*\\[0-9]+", "URL: (non fourni)", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"URL:\s*[\x00-\x1f]", "URL: (non fourni)", raw, flags=re.IGNORECASE)
     return raw
 
 def _cleanup_found_header(raw: str) -> str:
     return re.sub(r"^\s*Found\s+\d+\s+search\s+results:\s*\n?", "", raw, flags=re.IGNORECASE|re.MULTILINE)
 
 def ddg_search(query: str, topk: int = 5) -> str:
-    """
-    Version 'pretty' : essaie d'utiliser le JSON structuré du tool DDG,
-    corrige les URLs placeholder (\1, \2, ... ou toutes '\1') grâce aux ressources,
-    puis fallback robuste sur le texte brut.
-    """
     try:
         sc, texts = _mcp_call_tool_raw("ddg__search", {"query": query, "max_results": int(topk)}, timeout_s=60)
         url_candidates = _extract_http_urls_from_texts(texts)
@@ -696,6 +681,23 @@ def ddg_search(query: str, topk: int = 5) -> str:
             items = _walk_find_result_items(sc)
             if items:
                 items = _fix_placeholder_urls(items, url_candidates)
+
+                def _is_ph(u: str) -> bool:
+                    return (not u) or bool(re.fullmatch(r"\s*\\[0-9]+\s*", str(u)))
+
+                # Si on a encore des placeholders (ou aucun candidat), fallback texte
+                still_placeholders = any(
+                    _is_ph(it.get("url") or it.get("href") or it.get("link") or "")
+                    for it in items
+                )
+                if still_placeholders or not url_candidates:
+                    raw = mcp_call_tool_via_gateway(
+                        "ddg__search", {"query": query, "max_results": int(topk)}, timeout_s=60
+                    ) or "(vide)"
+                    raw = _replace_backref_urls(raw, url_candidates)
+                    raw = _cleanup_found_header(raw)
+                    return raw
+
                 return _format_ddg_items(items, max_items=int(topk))
 
         # 2) Fallback texte brut + remplacement
@@ -717,6 +719,56 @@ def ddg_fetch(url: str) -> str:
         return out or "(vide)"
     except Exception as e:
         return f"[MCP/ddg__fetch_content] {e}"
+
+# ---------- NOUVEAU : Augmenter la réponse vocale avec les résultats web identiques au chat ----------
+def _augment_vocal_msg_if_needed(messages: List[Dict[str, str]]) -> None:
+    """En mode vocal, si la dernière réponse assistant ne contient pas d'URL formatées,
+    on ajoute un bloc '🔎 Résultats...' identique au mode chat via ddg_search()."""
+    try:
+        if st.session_state.get("interaction_mode") != "vocal":
+            return
+
+        gw = CFG.get("mcp", {}).get("gateway", {})
+        if not gw.get("enabled", True):
+            return
+        if not messages:
+            return
+
+        # Trouver dernier assistant et dernier user avant lui
+        last_ass_idx = next((i for i in range(len(messages)-1, -1, -1)
+                             if messages[i].get("role") == "assistant"), None)
+        if last_ass_idx is None:
+            return
+        last_user_idx = next((i for i in range(last_ass_idx-1, -1, -1)
+                              if messages[i].get("role") == "user"), None)
+        if last_user_idx is None:
+            return
+
+        ass_text = messages[last_ass_idx].get("content", "") or ""
+        # Si déjà des URLs formatées, on ne touche rien
+        if re.search(r'\bURL:\s*https?://', ass_text):
+            return
+
+        # Anti-doublon (clé = question + longueur réponse)
+        cache = st.session_state.setdefault("_vocal_aug_cache", set())
+        user_q = (messages[last_user_idx].get("content") or "").strip()
+        if not user_q:
+            return
+        cache_key = f"{user_q}|{len(ass_text)}"
+        if cache_key in cache:
+            return
+
+        # Générer le bloc "pretty" identique au chat
+        pretty = ddg_search(user_q, topk=int(gw.get("auto_web_topk", 5)))
+        if pretty and pretty.strip():
+            messages[last_ass_idx]["content"] = (ass_text.rstrip() +
+                                                 "\n\n" +
+                                                 f"🔎 Résultats pour « {user_q} »\n\n{pretty}").strip()
+            cache.add(cache_key)
+    except Exception as e:
+        st.session_state.setdefault("agent_trace", []).append(
+            {"role": "system", "content": f"[Vocal augment error] {e}"}
+        )
 
 # ---------- Agent (legacy) : détection JSON dans le texte ----------
 _TOOL_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*([\s\S]*?)\s*```$", re.IGNORECASE | re.MULTILINE)
@@ -1080,6 +1132,10 @@ def _ingest_chat_from_logs(logs: List[str], *, rerun: bool = True):
 
     st.session_state["_assembling_assistant"] = assembling
     if changed:
+        # Ajout "pretty" en mode vocal si la réponse est juste un résumé
+        if st.session_state.get("interaction_mode") == "vocal":
+            _augment_vocal_msg_if_needed(msgs)
+
         st.session_state["messages"] = msgs[-200:]
         if rerun:
             st.rerun()
@@ -1616,8 +1672,14 @@ with tab_interface:
                 content = msg.get("content", "")
                 cls = "bubble assistant" if role != "user" else "bubble user"
                 safe_content = html.escape(str(content))
-                safe_content = re.sub(r'(https?://[^\s<]+)', r'<a href="\\1" target="_blank">\\1</a>', safe_content)
+                # Linkification robuste (évite de capturer la ponctuation finale)
+                safe_content = re.sub(
+                    r'(https?://[^\s<>"\')]+?)(?=[\s<>"\')]|[.,!?;:)](?:\s|$)|$)',
+                    r'<a href="\g<1>" target="_blank" rel="noopener noreferrer">\g<1></a>',
+                    safe_content,
+                )
                 safe_content = safe_content.replace("\n", "<br />")
+
                 bubbles.append(f'<div class="{cls}">{safe_content}</div>')
             return f"<div class='msgs' id='chatMsgs'>{''.join(bubbles)}</div>"
 
