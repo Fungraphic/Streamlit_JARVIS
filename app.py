@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex, asyncio, copy, math
+import os, json, time, subprocess, importlib.util, threading, queue, html, re, uuid, shlex, asyncio, copy, math, sys
 from typing import List, Dict, Any, Optional, Tuple, Union
 from pathlib import Path
 import streamlit as st
 import requests
 import streamlit.components.v1 as components  # <- pour l'iframe HTML du radar
 
-st.set_page_config(page_title="Jarvis — Streamlit UI (style shadcn) v3", layout="wide")
+# Import du style JARVIS HUD
+from jarvis_ui_style import inject_jarvis_css, render_chat_messages
+
+st.set_page_config(page_title="J.A.R.V.I.S. - Assistant Vocal Local", layout="wide", initial_sidebar_state="expanded")
+
+# Injecter le CSS JARVIS HUD
+st.markdown(inject_jarvis_css(), unsafe_allow_html=True)
 
 # -------------- Persistence --------------
 CONFIG_DIR = os.path.expanduser("~/.jarvis")
@@ -42,26 +48,40 @@ DEFAULT_CFG: Dict[str, Any] = {
     # --- LLM / Prompt système ---
     "llm": {
         "system_prompt": (
-            "Tu es JARVIS, un assistant francophone, concis et utile.\n"
-            "Tu as accès à des outils exposés via un Gateway MCP. Utilise les outils lorsque c’est pertinent, "
-            "et intègre leurs résultats pour répondre. Si aucun outil n’est nécessaire, réponds directement.\n"
-            "Toujours répondre en français, de façon brève et précise. Cite les URLs si présentes dans le contexte.\n"
+            "Tu es JARVIS, un assistant francophone, concis et utile.\n\n"
+            "═══ RÈGLE D'OR : RÉPONDS DIRECTEMENT SANS OUTIL PAR DÉFAUT ═══\n\n"
+            "Tu as accès à des outils (documentation, web, conversions). N'utilise un outil QUE si strictement nécessaire.\n\n"
+            "❌ NE PAS UTILISER D'OUTIL pour :\n"
+            "• Salutations : \"Bonjour\" → Réponds : \"Bonjour ! Comment puis-je vous aider ?\"\n"
+            "• Questions sur toi : \"Qui es-tu ?\" → Réponds : \"Je suis JARVIS, votre assistant.\"\n"
+            "• Explications générales : \"C'est quoi Python ?\" → Utilise tes connaissances\n"
+            "• Conversations courantes : \"Comment vas-tu ?\", \"Merci\", etc.\n\n"
+            "✅ UTILISER UN OUTIL uniquement pour :\n"
+            "• Heure/timezone : \"Quelle heure à Tokyo ?\" → outil 'get_current_time' ou 'convert_time'\n"
+            "• Documentation précise : \"Doc Python asyncio\" → outil 'get-library-docs' avec library exacte\n"
+            "• Recherche web : \"Cherche les news\" → outil 'fetch'\n"
+            "• Code Python : \"Analyse ce code\" → outil 'analyze_python_file'\n\n"
+            "EXEMPLES CONCRETS :\n"
+            "Q: \"Bonjour\" → R: \"Bonjour ! Comment puis-je vous aider ?\" [PAS D'OUTIL]\n"
+            "Q: \"Explique asyncio\" → R: \"asyncio est un module Python pour...\" [PAS D'OUTIL]\n"
+            "Q: \"Quelle heure à New York ?\" → R: [OUTIL: convert_time avec timezone]\n"
+            "Q: \"Doc React hooks\" → R: [OUTIL: get-library-docs avec react]\n\n"
+            "Toujours répondre en français, de façon brève et précise.\n"
         ),
-        # Héritage / options d’agent
+        # Héritage / options d'agent
         "agent_enabled": False,        # (legacy) heuristique bloc JSON
-        "agent_max_rounds": 3,         # nombre max de tours pour l’agent (tool-calling inclus)
+        "agent_max_rounds": 3,         # nombre max de tours pour l'agent (tool-calling inclus)
         "selector_json": False,        # (legacy) sélecteur JSON manuel
         "use_ollama_tools": True       # <-- clé principale : activer tool-calling natif Ollama
     },
-    # --- MCP: configuration via MCPJungle Gateway ---
+    # --- MCP: configuration via Docker MCP Toolkit ---
     "mcp": {
-        "gateway": {
-            "enabled": True,
-            "base_url": "http://127.0.0.1:8080",  # /mcp (Streamable HTTP) ou /sse (fallback)
-            "auth_header": "",                     # ex: "Bearer xxxxx"
-            "auto_web": False,                     # <- OFF par défaut pour forcer le modèle à choisir les tools
+        "docker": {
+            "enabled": True,  # ← Activé par défaut si Docker MCP disponible
+            "docker_cmd": "docker",  # Commande docker (peut être chemin absolu)
+            "auto_web": False,  # <- OFF par défaut pour forcer le modèle à choisir les tools
             "auto_web_topk": 5,
-            "chat_shortcuts": True                 # /web /fetch /tool
+            "chat_shortcuts": True  # /web /fetch /tool
         }
     },
     "jarvis": {
@@ -80,22 +100,21 @@ DEFAULT_CFG: Dict[str, Any] = {
 MCP_LOG_DIR = os.path.join(CONFIG_DIR, "mcp-logs")
 os.makedirs(MCP_LOG_DIR, exist_ok=True)
 
-def _normalize_mcp_gateway(cfg: Dict[str, Any]) -> None:
+def _normalize_mcp_docker(cfg: Dict[str, Any]) -> None:
     """
-    Normalise la section MCP pour la topologie 'gateway'.
-    Purge les anciennes clés (servers/proxy/jungle).
+    Normalise la section MCP pour Docker MCP Toolkit.
+    Purge les anciennes clés (gateway/servers/proxy/jungle).
     """
     mcp = cfg.setdefault("mcp", {})
-    gw = mcp.get("gateway") or {}
-    mcp["gateway"] = {
-        "enabled": bool(gw.get("enabled", True)),
-        "base_url": str(gw.get("base_url", "http://127.0.0.1:8080")),
-        "auth_header": str(gw.get("auth_header", "")),
-        "auto_web": bool(gw.get("auto_web", False)),
-        "auto_web_topk": int(gw.get("auto_web_topk", 5)),
-        "chat_shortcuts": bool(gw.get("chat_shortcuts", True)),
+    docker = mcp.get("docker") or {}
+    mcp["docker"] = {
+        "enabled": bool(docker.get("enabled", True)),  # Activé par défaut
+        "docker_cmd": str(docker.get("docker_cmd", "docker")),
+        "auto_web": bool(docker.get("auto_web", False)),
+        "auto_web_topk": int(docker.get("auto_web_topk", 5)),
+        "chat_shortcuts": bool(docker.get("chat_shortcuts", True)),
     }
-    for legacy in ("servers", "proxy", "jungle"):
+    for legacy in ("gateway", "servers", "proxy", "jungle"):
         if legacy in mcp:
             try:
                 del mcp[legacy]
@@ -114,12 +133,12 @@ def load_cfg() -> Dict[str, Any]:
                         cfg[k] = {**cfg.get(k, {}), **copy.deepcopy(v)}
                     else:
                         cfg[k] = v
-                _normalize_mcp_gateway(cfg)
+                _normalize_mcp_docker(cfg)
                 return cfg
     except Exception as e:
         st.warning(f"Lecture config échouée: {e}")
     cfg = copy.deepcopy(DEFAULT_CFG)
-    _normalize_mcp_gateway(cfg)
+    _normalize_mcp_docker(cfg)
     return cfg
 
 def save_cfg(cfg: Dict[str, Any]):
@@ -152,7 +171,7 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
     jarvis_cfg = cfg.get("jarvis", {})
     piper_cfg = cfg.get("piper", {})
     ollama_cfg = cfg.get("ollama", {})
-    gateway_cfg = (cfg.get("mcp", {}).get("gateway") or {})
+    docker_cfg = (cfg.get("mcp", {}).get("docker") or {})
 
     env_map = {
         "FW_MODEL": whisper.get("model"),
@@ -183,12 +202,11 @@ def _apply_env_from_cfg(cfg: Dict[str, Any]):
         "OLLAMA_NUM_CTX": str(ollama_cfg.get("num_ctx", 4096)),
         "OLLAMA_STREAM": "1" if ollama_cfg.get("stream") else "0",
         "MCP_SERVERS_JSON": "[]",  # Legacy compat
-        "MCP_GATEWAY_ENABLED": "1" if gateway_cfg.get("enabled", True) else "0",
-        "MCP_GATEWAY_BASE_URL": gateway_cfg.get("base_url"),
-        "MCP_GATEWAY_AUTH_HEADER": gateway_cfg.get("auth_header"),
-        "MCP_GATEWAY_AUTO_WEB": "1" if gateway_cfg.get("auto_web", False) else "0",
-        "MCP_GATEWAY_AUTO_WEB_TOPK": str(gateway_cfg.get("auto_web_topk", 5)),
-        "MCP_GATEWAY_CHAT_SHORTCUTS": "1" if gateway_cfg.get("chat_shortcuts", True) else "0",
+        "MCP_DOCKER_ENABLED": "1" if docker_cfg.get("enabled", True) else "0",
+        "MCP_DOCKER_CMD": docker_cfg.get("docker_cmd", "docker"),
+        "MCP_AUTO_WEB": "1" if docker_cfg.get("auto_web", False) else "0",
+        "MCP_AUTO_WEB_TOPK": str(docker_cfg.get("auto_web_topk", 5)),
+        "MCP_CHAT_SHORTCUTS": "1" if docker_cfg.get("chat_shortcuts", True) else "0",
     }
     for key, value in env_map.items():
         if value is None:
@@ -462,97 +480,107 @@ def _fmt_call_result(result: Any) -> str:
     out = "\n".join([p for p in parts if p]) or "(vide)"
     return out
 
-def _mcp_gateway_cfg() -> Dict[str, Any]:
-    return (CFG.get("mcp", {}).get("gateway") or {})
+def _mcp_docker_cfg() -> Dict[str, Any]:
+    return (CFG.get("mcp", {}).get("docker") or {})
 
-# --- Liste complète des tools (avec schema) ---
+# --- Liste complète des tools (avec schema) via Docker MCP ---
 def mcp_list_tools_full_via_gateway() -> List[Dict[str, Any]]:
     """
-    Récupère name/description/inputSchema pour chaque tool via Streamable HTTP (/mcp) ou SSE (/sse).
+    Récupère name/description/inputSchema pour chaque tool via Docker MCP Gateway (stdio).
+    Retourne une liste vide si Docker MCP n'est pas accessible.
     """
-    gw = _mcp_gateway_cfg()
-    base = (gw.get("base_url", "") or "").rstrip("/")
-    headers = {"Authorization": gw["auth_header"]} if gw.get("auth_header") else {}
+    docker_cfg = _mcp_docker_cfg()
+    if not docker_cfg.get("enabled", True):
+        return []
 
+    docker_cmd = docker_cfg.get("docker_cmd", "docker")
+
+    # Utiliser Docker MCP Gateway via stdio
     try:
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client  # transport moderne
+        from mcp.client.stdio import stdio_client, StdioServerParameters
+
         async def _go():
-            async with streamablehttp_client(f"{base}/mcp", headers=headers) as (r, w, _):
-                async with ClientSession(r, w) as sess:
-                    await sess.initialize()
-                    resp = await sess.list_tools()
+            # Lancer docker mcp gateway run en subprocess stdio
+            server_params = StdioServerParameters(
+                command=docker_cmd,
+                args=["mcp", "gateway", "run"],
+                env=None
+            )
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    resp = await session.list_tools()
                     return [dict(
                         name=t.name,
                         description=(t.description or ""),
                         inputSchema=(getattr(t, "inputSchema", None) or {})
                     ) for t in (resp.tools or [])]
-        return asyncio.run(_go())
-    except Exception:
-        # Fallback SSE (certains gateways exposent aussi /sse)
-        from mcp import ClientSession
-        from mcp.client.sse import sse_client
-        async def _go_sse():
-            async with sse_client(f"{base}/sse", headers=headers) as (r, w):
-                async with ClientSession(r, w) as sess:
-                    await sess.initialize()
-                    resp = await sess.list_tools()
-                    return [dict(
-                        name=t.name,
-                        description=(t.description or ""),
-                        inputSchema=(getattr(t, "inputSchema", None) or {})
-                    ) for t in (resp.tools or [])]
-        return asyncio.run(_go_sse())
+
+        # Utiliser get_event_loop ou créer un nouveau selon le contexte
+        try:
+            loop = asyncio.get_running_loop()
+            # Si un loop existe déjà, créer une tâche synchrone via thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _go())
+                return future.result(timeout=65)
+        except RuntimeError:
+            # Pas de loop actif, utiliser asyncio.run normalement
+            return asyncio.run(_go())
+    except Exception as e:
+        # Docker MCP non accessible : retourner liste vide (pas une erreur fatale)
+        import sys
+        print(f"[MCP] Docker MCP Gateway non accessible: {e}", file=sys.stderr)
+        return []
 
 def mcp_call_tool_via_gateway(tool: str, arguments: Dict[str, Any], timeout_s: int = 60) -> str:
-    """Appelle un tool via le gateway MCPJungle."""
-    gw = _mcp_gateway_cfg()
-    base = (gw.get("base_url", "") or "").rstrip("/")
-    headers = {"Authorization": gw["auth_header"]} if gw.get("auth_header") else {}
+    """Appelle un tool via Docker MCP Gateway (stdio). Mode chat uniquement."""
+    docker_cfg = _mcp_docker_cfg()
+    docker_cmd = docker_cfg.get("docker_cmd", "docker")
 
-    # Streamable HTTP
     try:
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client
-        async def _go():
-            async with streamablehttp_client(f"{base}/mcp", headers=headers) as (r, w, _):
-                async with ClientSession(r, w) as sess:
-                    await sess.initialize()
-                    try:
-                        res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
-                    except asyncio.TimeoutError:
-                        return "[MCP] Timeout d'exécution du tool."
-                    return _fmt_call_result(res)
-        return asyncio.run(_go())
-    except Exception:
-        from mcp import ClientSession
-        from mcp.client.sse import sse_client
-        async def _go_sse():
-            async with sse_client(f"{base}/sse", headers=headers) as (r, w):
-                async with ClientSession(r, w) as sess:
-                    await sess.initialize()
-                    try:
-                        res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
-                    except asyncio.TimeoutError:
-                        return "[MCP] Timeout d'exécution du tool."
-                    return _fmt_call_result(res)
-        return asyncio.run(_go_sse())
+        from mcp.client.stdio import stdio_client, StdioServerParameters
 
-# ----- Récupération "raw" d'un tool (structuredContent + textes) -----
+        async def _go():
+            server_params = StdioServerParameters(
+                command=docker_cmd,
+                args=["mcp", "gateway", "run"],
+                env=None
+            )
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    try:
+                        res = await asyncio.wait_for(session.call_tool(tool, arguments or {}), timeout=timeout_s)
+                    except asyncio.TimeoutError:
+                        return "[MCP] Timeout d'exécution du tool."
+                    return _fmt_call_result(res)
+
+        return asyncio.run(_go())
+    except Exception as e:
+        return f"[MCP] Erreur Docker MCP: {e}"
+
+# ----- Récupération "raw" d'un tool (structuredContent + textes) via Docker MCP -----
 def _mcp_call_tool_raw(tool: str, arguments: Dict[str, Any], timeout_s: int = 60) -> Tuple[Any, List[str]]:
-    gw = _mcp_gateway_cfg()
-    base = (gw.get("base_url", "") or "").rstrip("/")
-    headers = {"Authorization": gw["auth_header"]} if gw.get("auth_header") else {}
+    docker_cfg = _mcp_docker_cfg()
+    docker_cmd = docker_cfg.get("docker_cmd", "docker")
 
     try:
         from mcp import ClientSession, types as _t
-        from mcp.client.streamable_http import streamablehttp_client
+        from mcp.client.stdio import stdio_client, StdioServerParameters
 
         async def _go():
-            async with streamablehttp_client(f"{base}/mcp", headers=headers) as (r, w, _):
-                async with ClientSession(r, w) as sess:
-                    await sess.initialize()
-                    res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
+            server_params = StdioServerParameters(
+                command=docker_cmd,
+                args=["mcp", "gateway", "run"],
+                env=None
+            )
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    res = await asyncio.wait_for(session.call_tool(tool, arguments or {}), timeout=timeout_s)
                     sc = getattr(res, "structuredContent", None)
                     texts: List[str] = []
                     for c in getattr(res, "content", []) or []:
@@ -567,30 +595,7 @@ def _mcp_call_tool_raw(tool: str, arguments: Dict[str, Any], timeout_s: int = 60
         return asyncio.run(_go())
 
     except Exception:
-        # Fallback SSE
-        try:
-            from mcp import ClientSession, types as _t
-            from mcp.client.sse import sse_client
-
-            async def _go_sse():
-                async with sse_client(f"{base}/sse", headers=headers) as (r, w):
-                    async with ClientSession(r, w) as sess:
-                        await sess.initialize()
-                        res = await asyncio.wait_for(sess.call_tool(tool, arguments or {}), timeout=timeout_s)
-                        sc = getattr(res, "structuredContent", None)
-                        texts: List[str] = []
-                        for c in getattr(res, "content", []) or []:
-                            if isinstance(c, _t.TextContent):
-                                texts.append(c.text)
-                            elif isinstance(c, _t.EmbeddedResource):
-                                uri = getattr(c.resource, "uri", "")
-                                if uri:
-                                    texts.append(uri)
-                        return sc, texts
-
-            return asyncio.run(_go_sse())
-        except Exception:
-            return None, []
+        return None, []
 
 # ----- Parcours générique et fix placeholders (nouveau helper) -----
 def _walk_find_result_items(obj) -> List[Dict[str, Any]]:
@@ -665,7 +670,7 @@ def _format_ddg_items(items: List[Dict[str, Any]], max_items: int) -> str:
         block = f"{i}. {title}\n   URL: {url}\n   Summary: {summary}".rstrip()
         out_lines.append(block)
     return "\n\n".join(out_lines) if out_lines else "(aucun résultat)"
-    
+
 # ----- Helpers URLs (mis à jour) -----
 def _extract_http_urls_from_texts(texts: List[str]) -> List[str]:
     urls: List[str] = []
@@ -765,8 +770,8 @@ def _augment_vocal_msg_if_needed(messages: List[Dict[str, str]]) -> None:
         if st.session_state.get("interaction_mode") != "vocal":
             return
 
-        gw = CFG.get("mcp", {}).get("gateway", {})
-        if not gw.get("enabled", True):
+        docker = CFG.get("mcp", {}).get("docker", {})
+        if not docker.get("enabled", True):
             return
         if not messages:
             return
@@ -796,7 +801,7 @@ def _augment_vocal_msg_if_needed(messages: List[Dict[str, str]]) -> None:
             return
 
         # Générer le bloc "pretty" identique au chat
-        pretty = ddg_search(user_q, topk=int(gw.get("auto_web_topk", 5)))
+        pretty = ddg_search(user_q, topk=int(docker.get("auto_web_topk", 5)))
         if pretty and pretty.strip():
             messages[last_ass_idx]["content"] = (ass_text.rstrip() +
                                                  "\n\n" +
@@ -837,7 +842,7 @@ def _extract_tool_json(text: str) -> Optional[Dict[str, Any]]:
 
 def maybe_run_tool_and_answer(cfg: Dict[str, Any], msgs: List[Dict[str, str]], llm_first_reply: str) -> Optional[str]:
     """
-    (Legacy) Si 'llm_first_reply' contient un JSON d'appel d'outil, exécute l’outil via MCP,
+    (Legacy) Si 'llm_first_reply' contient un JSON d'appel d'outil, exécute l'outil via MCP,
     insère le résultat, puis relance le LLM. Retourne la réponse finale si un outil a été utilisé.
     """
     if not (cfg.get("llm", {}).get("agent_enabled", False)):
@@ -858,7 +863,7 @@ def maybe_run_tool_and_answer(cfg: Dict[str, Any], msgs: List[Dict[str, str]], l
         msgs.append({"role": "system", "content": f"[Agent] Appel outil demandé : {tool_name} {json.dumps(args, ensure_ascii=False)}"})
         out = mcp_call_tool_via_gateway(tool_name, args, timeout_s=90)
         msgs.append({"role": "system", "content": f"[Résultat outil: {tool_name}]\n{out}"})
-        msgs.append({"role": "system", "content": "À partir du résultat d’outil ci-dessus, réponds brièvement en français et cite les URLs si pertinentes."})
+        msgs.append({"role": "system", "content": "À partir du résultat d'outil ci-dessus, réponds brièvement en français et cite les URLs si pertinentes."})
         current_reply = ollama_reply(cfg, msgs)
 
     if used_any_tool:
@@ -866,7 +871,7 @@ def maybe_run_tool_and_answer(cfg: Dict[str, Any], msgs: List[Dict[str, str]], l
         return current_reply or ""
     return None
 
-# ---------- NOUVEAU : Tool-calling natif Ollama (boucle d’agent) ----------
+# ---------- NOUVEAU : Tool-calling natif Ollama (boucle d'agent) ----------
 def build_ollama_tools_from_mcp() -> List[Dict[str, Any]]:
     """
     Transforme les tools MCP (name/description/inputSchema) en liste Ollama 'tools'.
@@ -891,11 +896,11 @@ def build_ollama_tools_from_mcp() -> List[Dict[str, Any]]:
 
 def chat_with_tools_agent(cfg: Dict[str, Any], user_text: str, ui_msgs: List[Dict[str, str]]) -> Optional[str]:
     """
-    Boucle d’agent Tool-Calling:
+    Boucle d'agent Tool-Calling:
       - Passe la liste des tools à Ollama
-      - Laisse le modèle décider d’appeler 0..N tools
+      - Laisse le modèle décider d'appeler 0..N tools
       - Exécute chaque tool_call via MCP puis renvoie les résultats (role='tool')
-      - Reboucle jusqu’à absence de tool_calls ou max_rounds atteint
+      - Reboucle jusqu'à absence de tool_calls ou max_rounds atteint
     Retourne la réponse finale (texte) ou None si échec.
     NOTE: ui_msgs sert de buffer de traces (role='system'), invisible côté UI.
     """
@@ -989,6 +994,10 @@ if "assistant_vu_history" not in st.session_state:
     st.session_state.assistant_vu_history = []
 if "mode_toggle" not in st.session_state:
     st.session_state.mode_toggle = False
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "username" not in st.session_state:
+    st.session_state.username = "User"
 
 def _set_interaction_mode(mode: str):
     mode = "vocal" if mode == "vocal" else "chat"
@@ -1003,10 +1012,8 @@ def _sync_mode_from_toggle():
     desired = "vocal" if st.session_state.get("mode_toggle") else "chat"
     _set_interaction_mode(desired)
 
-# _set_interaction_mode(st.session_state.interaction_mode)
-
 def _on_mode_toggle():
-    # Le widget est la vérité : on pousse l’état vers interaction_mode
+    # Le widget est la vérité : on pousse l'état vers interaction_mode
     is_vocal = bool(st.session_state.get("mode_toggle"))
     _set_interaction_mode("vocal" if is_vocal else "chat")
     # Si tu as implémenté la commande micro :
@@ -1055,7 +1062,7 @@ def start_jarvis(cfg: Dict[str, Any]):
         t.start()
         st.session_state.jarvis_thread = t
         st.session_state.jarvis_running = True
-        # ⬇️ NOUVEAU : applique l’état micro selon le mode actuel
+        # ⬇️ NOUVEAU : applique l'état micro selon le mode actuel
         _send_mic_state(st.session_state.get("interaction_mode", "chat") == "vocal")
         st.success("Jarvis démarré (audio local).")
     except Exception as e:
@@ -1201,15 +1208,16 @@ def process_user_text(clean_text: str, origin: str = "chat", already_appended: b
     """
     msgs = st.session_state.setdefault("messages", [])
     agent_trace = st.session_state.setdefault("agent_trace", [])
-    gw = CFG.get("mcp", {}).get("gateway", {})
+    docker = CFG.get("mcp", {}).get("docker", {})
     used_gateway = False
 
     # Ajouter le message user si pas déjà ajouté par le handler d'UI
     if not already_appended:
         msgs.append({"role": "user", "content": clean_text})
 
-    # (0) Tool-calling natif (si dispo)
-    if CFG.get("llm", {}).get("use_ollama_tools", True):
+    # (0) Tool-calling natif (si dispo ET mode chat uniquement)
+    # En mode vocal, on désactive les outils MCP pour éviter les conflits asyncio
+    if CFG.get("llm", {}).get("use_ollama_tools", True) and origin == "chat":
         final = chat_with_tools_agent(CFG, clean_text, agent_trace)
         if isinstance(final, str) and final.strip():
             msgs.append({"role": "assistant", "content": final})
@@ -1219,14 +1227,14 @@ def process_user_text(clean_text: str, origin: str = "chat", already_appended: b
             return
 
     # (1) Raccourcis (/web, /fetch, /tool) — AFFICHAGE DIRECT des résultats (pas de résumé)
-    if origin == "chat" and gw.get("chat_shortcuts", True) and gw.get("enabled", True):
+    if origin == "chat" and docker.get("chat_shortcuts", True) and docker.get("enabled", True):
         m_ddg  = re.match(r"^/(?:web|ddg)\s+(.+)$", clean_text, flags=re.IGNORECASE)
         m_fetch = re.match(r"^/fetch\s+(\S+)$", clean_text, flags=re.IGNORECASE)
         m_tool  = re.match(r"^/tool\s+([A-Za-z0-9_.:\-]+)\s*(.*)$", clean_text)
 
         if m_ddg:
             query = m_ddg.group(1).strip()
-            pretty = ddg_search(query, topk=int(gw.get('auto_web_topk',5)))
+            pretty = ddg_search(query, topk=int(docker.get('auto_web_topk',5)))
             msgs.append({"role": "assistant", "content": f"🔎 Résultats pour « {query} »\n\n{pretty}"})
             st.session_state["messages"] = msgs[-200:]
             st.session_state.last_assistant_ts = time.time()
@@ -1270,8 +1278,8 @@ def process_user_text(clean_text: str, origin: str = "chat", already_appended: b
             return
 
     # (2) Auto-web (si activé) — AFFICHAGE DIRECT 'pretty'
-    if gw.get("enabled", True) and gw.get("auto_web", False) and not used_gateway:
-        pretty = ddg_search(clean_text, topk=int(gw.get("auto_web_topk", 5)))
+    if docker.get("enabled", True) and docker.get("auto_web", False) and not used_gateway:
+        pretty = ddg_search(clean_text, topk=int(docker.get("auto_web_topk", 5)))
         msgs.append({"role": "assistant", "content": f"🔎 Résultats (auto) pour « {clean_text} »\n\n{pretty}"})
         st.session_state["messages"] = msgs[-200:]
         st.session_state.last_assistant_ts = time.time()
@@ -1308,729 +1316,198 @@ def _ort_providers() -> Tuple[List[str], str]:
     except Exception as e:
         return [], f"ERR: {getattr(e, '__class__', type(e)).__name__}"
 
-# -------------- CSS --------------
-st.markdown("""
-<style>
-:root{
-  --bg: #0b0f14; --panel: #0e141b; --muted: #121923; --border: #1b2633;
-  --primary: #44f1ff; --primary-2: #00c2d1; --fg: #e6f1ff; --muted-fg:#7b8ba1; --accent:#101926;
-  --ok: #2ecc71; --bad: #e74c3c;
-}
-.main .block-container{ padding-top: 0rem; }
-body{
-  background: radial-gradient(900px 450px at 50% 28%, rgba(0, 194, 209, 0.08), transparent 55%),
-              radial-gradient(700px 400px at 70% 20%, rgba(68,241,255,0.05), transparent 60%),
-              linear-gradient(180deg, #0b0f14 0%, #0a0e13 100%);
-  color: var(--fg);
-}
-body::before{
-  content:""; position:fixed; inset:0;
-  background:
-     linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px) 0 0/ 60px 60px,
-     linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px) 0 0/ 60px 60px;
-  mask-image: radial-gradient(circle at 50% 28%, black 0%, transparent 70%);
-  pointer-events:none;
-}
-.topbar{ position: sticky; top: 0; z-index: 2; backdrop-filter: blur(6px);
-  background: linear-gradient(180deg, rgba(11,15,20,0.85) 0%, rgba(11,15,20,0.35) 100%);
-  border-bottom: 1px solid var(--border); padding: 10px 14px; margin-bottom: 8px; }
-.status-row{ display:flex; gap:16px; flex-wrap:wrap; align-items:center; justify-content:space-between; }
-.status-left{ display:flex; gap:16px; align-items:center; }
-.pill{ display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px;
-  background: linear-gradient(180deg, var(--panel), var(--muted)); border: 1px solid var(--border);
-  font-family: ui-monospace; font-size: 12px; color: var(--fg); }
-.dot{ width:8px; height:8px; border-radius:999px; opacity:.95 }
-.dot.ok{ background: var(--ok); box-shadow: 0 0 12px rgba(46,204,113,.9), 0 0 30px rgba(46,204,113,.35); animation: pulse 1.6s ease-in-out infinite; }
-.dot.bad{ background: var(--bad); box-shadow: 0 0 12px rgba(231,76,60,.9), 0 0 30px rgba(231,76,60,.35); }
-@keyframes pulse{0%{transform:scale(.9);opacity:.8}50%{transform:scale(1.2);opacity:1}100%{transform:scale(.9);opacity:.8}}
-.card{ background: linear-gradient(180deg, var(--panel), var(--muted)); border: 1px solid var(--border); border-radius: 14px; padding: 14px; }
-.card h3{ margin: 0 0 8px 0; color: var(--fg); }
-.muted{ color: var(--muted-fg); }
-.chat-card{ display:flex; flex-direction:column; }
-.chat-card-body{ display:flex; flex-direction:column; gap:14px; }
-.chat-wrap{ display:flex; flex-direction:column; height:520px; }
-.msgs{ flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; padding-right:6px; min-width:0; }
-.bubble{ max-width: 92%; padding:10px 12px; border-radius: 12px; border: 1px solid var(--border); white-space:pre-wrap; overflow-wrap:anywhere; }
-.user{ align-self:flex-end; background: rgba(68,241,255,0.08); }
-.assistant{ align-self:flex-start; background: rgba(255,255,255,0.04); }
-.chat-input input{ background: var(--accent) !important; color: var(--fg) !important; border:1px solid var(--border); border-radius: 10px; padding:10px 12px; }
-.chat-send button{ background: linear-gradient(180deg, #0b485b, #083947); border:1px solid var(--primary-2); color: white; border-radius: 10px; padding:10px 14px; }
-
-/* --- Barre inline (saisie + toggles + bouton) --- */
-.stColumn > div:has([data-testid="stToggle"]) {
-  display: flex; align-items: center; justify-content: center; height: 100%;
-}
-[data-testid="stToggle"] {
-  background: var(--accent); border: 1px solid var(--border);
-  padding: 8px 10px; border-radius: 10px;
-}
-[data-testid="stToggle"] label { color: var(--fg); font-weight: 600; font-size: 13px; }
-</style>
-""", unsafe_allow_html=True)
-st.markdown("""
-<style>
-/* Overrides spacing toggles */
-.stColumn > div:has([data-testid="stToggle"]) { display:flex; flex-direction:column; align-items:flex-start; justify-content:flex-start; gap:3px; height:auto; }
-[data-testid="stToggle"] { padding:2px 2px; margin:0; }
-div[data-testid="stVerticalBlock"] > div:has(> [data-testid="stToggle"]) { margin:0; }
-</style>
-""", unsafe_allow_html=True)
-st.markdown("""
-<style>
-/* (A) Enlever totalement le header Streamlit (nouvelle structure: <header …>) */
-header[data-testid="stHeader"], [data-testid="stHeader"]{
-  display: none !important;
-  height: 0 !important;
-  min-height: 0 !important;
-  padding: 0 !important;
-  margin: 0 !important;
-}
-
-/* (B) Retirer la marge du body qui ajoute 8 px en haut */
-html, body{
-  margin: 0 !important;
-  padding: 0 !important;
-}
-
-/* (C) Supprimer tout rembourrage supérieur du conteneur principal */
-[data-testid="stAppViewContainer"] > .main{
-  padding-top: 0 !important;
-  margin-top: 0 !important;
-}
-section.main > div.block-container{
-  padding-top: 0 !important;
-}
-
-/* (D) S'assurer que ta topbar colle bien au bord du haut */
-.topbar{ margin-top: 0 !important; }
-</style>
-""", unsafe_allow_html=True)
-st.markdown("""
-<style>
-/* 1) Kill the toolbar spacer completely */
-[data-testid="stToolbar"]{
-  display:none !important;
-  height:0 !important;
-  min-height:0 !important;
-  padding:0 !important;
-  margin:0 !important;
-}
-
-/* (you already hide the header; keep it for safety) */
-header[data-testid="stHeader"], [data-testid="stHeader"], [data-testid="stDecoration"]{
-  display:none !important;
-  height:0 !important; min-height:0 !important;
-  padding:0 !important; margin:0 !important;
-}
-
-/* 2) Remove any top padding still applied to the app containers */
-#root, .stApp, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main{
-  padding-top:0 !important;
-  margin-top:0 !important;
-}
-
-/* 3) Ensure the first block (that contains your .topbar) has no offset */
-.block-container:first-child{
-  padding-top:0 !important;
-  margin-top:0 !important;
-}
-
-/* 4) Force your topbar to start at the absolute top of the viewport */
-.topbar{
-  position: sticky;   /* keep your sticky behavior */
-  top: 0 !important;
-  margin-top: 0 !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# -------------- Top bar --------------
-def _pill_html(name: str, ok: bool, label: str) -> str:
-    cls = "dot ok" if ok else "dot bad"
-    safe_label = html.escape(label)
-    return f'<div class="pill"><div class="{cls}"></div><span>{name}</span><span class="muted">• {safe_label}</span></div>'
-
-ollama_up = is_ollama_up(CFG["ollama"]["host"])
-ollama_status = "Up" if ollama_up else "Down"
-
-gw = CFG.get("mcp", {}).get("gateway", {})
-mcp_ok = bool(gw.get("enabled", False))
-mcp_host_label = gw.get("base_url", "") or "off"
-pill_mcp = _pill_html("MCP", mcp_ok, mcp_host_label)
-
-jarvis_running = bool(st.session_state.get("jarvis_running"))
-whisper_ok = jarvis_running
-whisper_label = "Ready" if whisper_ok else "Off"
-
-voice_path = _maybe_join_voice(CFG["piper"].get("base_dir", ""), CFG["piper"].get("voice", ""))
-piper_ok = jarvis_running and CFG["jarvis"].get("tts_engine") == "piper" and voice_path and os.path.exists(voice_path)
-piper_label = "Ready" if piper_ok else "Off"
-
-ort_provs, ort_label = _ort_providers()
-ort_ok = bool(ort_provs)
-pill_ort = _pill_html("ONNXRT", ort_ok, ort_label)
-
-pill_whisper = _pill_html("WHISPER", whisper_ok, whisper_label)
-pill_piper   = _pill_html("PIPER",   piper_ok,   piper_label)
-pill_ollama  = _pill_html("OLLAMA",  ollama_up,  ollama_status)
-
-st.markdown(
-    f"""
-<div class="topbar">
-  <div class="status-row">
-    <div class="status-left">
-      {pill_whisper}
-      {pill_piper}
-      {pill_ollama}
-      {pill_mcp}
-      {pill_ort}
-    </div>
-    <div></div>
-  </div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
 # ---------- Helper pour afficher le radar ----------
-def render_radar(speaking: bool, mode: str, vu_history: List[Tuple[float, float]]):
-    svg_cls = "speaking" if speaking else ""
-    center_cls = "speaking" if speaking else ""
-    label = "Mode vocal" if mode == "vocal" else "Mode chat"
+# Fonction render_radar supprimée - remplacée par image statique
 
-    now = time.time()
-    history_payload: List[Dict[str, float]] = []
-    for entry in vu_history[-240:]:
-        try:
-            ts, val = entry
-        except (TypeError, ValueError):
-            continue
-        try:
-            stamp = float(ts)
-            level_val = float(val)
-        except (TypeError, ValueError):
-            continue
-        if not (math.isfinite(stamp) and math.isfinite(level_val)):
-            continue
-        level_val = max(0.0, min(1.0, level_val))
-        dt = max(0.0, now - stamp)
-        history_payload.append({"dt": dt, "level": level_val})
+# =============================================================================
+# LAYOUT JARVIS - NO TABS, 2 COLUMNS
+# =============================================================================
 
-    current_level = max(0.0, min(1.0, float(st.session_state.get("assistant_vu_level", 0.0))))
-    initial_level = history_payload[-1]["level"] if history_payload else current_level
-    history_json = json.dumps(history_payload, ensure_ascii=False)
+# Header - Espace réduit de 75% (10px → 2.5px)
+st.markdown("""
+<div style="text-align: center; padding: 2.5px 0;">
+    <h1 style="font-size: 48px; margin: 0;">J.A.R.V.I.S.</h1>
+    <p style="color: var(--jarvis-muted); font-size: 14px; letter-spacing: 0.2em; text-transform: uppercase;">
+        Just A Rather Very Intelligent System
+    </p>
+</div>
+""", unsafe_allow_html=True)
 
-    html_snippet = f"""
-    <html>
-    <head>
-      <meta charset="utf-8" />
-      <style>
-        body {{
-          margin: 0; padding: 0;
-          background: transparent;
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        }}
-        .wrap {{
-          background: linear-gradient(180deg, #0e141b, #121923);
-          border: 1px solid #1b2633;
-          border-radius: 14px;
-          padding: 14px;
-        }}
-        .title {{ color: #e6f1ff; margin: 0 0 8px 0; font-weight: 600; }}
-        .radar-container {{
-          position: relative; width: min(100%, 400px); aspect-ratio: 1;
-          display: flex; align-items: center; justify-content: center; margin: 0 auto;
-          filter: drop-shadow(0 0 20px rgba(68,241,255,.20));
-        }}
-        svg {{ width: 100%; height: 100%; }}
-        .radar-center-circle {{ fill: #0d7a8f; transition: fill .3s ease; }}
-        .radar-center-circle.speaking {{ fill: #00d4e8; filter: drop-shadow(0 0 15px rgba(68,241,255,.6)); }}
-        .radar-dot {{ fill: #00d4e8; opacity: .9; }}
-        .wave {{
-          fill: none;
-          stroke: #00d4e8;
-          stroke-width: 2;
-          opacity: 0;
-          transition: opacity .25s ease;
-        }}
-        .radar-container[data-speaking="false"] .wave {{
-          opacity: 0 !important;
-        }}
-        @media (prefers-reduced-motion: reduce) {{
-          .wave {{
-            transition: none;
-          }}
-        }}
-        .radar-status {{
-          text-align:center; margin-top:8px; color:#44f1ff; font-size:13px;
-          letter-spacing:1px; text-transform:uppercase;
-        }}
-      </style>
-    </head>
-    <body>
-      <div class="wrap">
-        <h3 class="title">Radar Vocal</h3>
-        <div class="radar-container" data-speaking="{str(bool(speaking)).lower()}" data-level="{initial_level:.3f}">
-          <svg class="{svg_cls}" viewBox="0 0 300 300" preserveAspectRatio="xMidYMid meet">
-            <defs>
-              <filter id="glow">
-                <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
-                <feMerge>
-                  <feMergeNode in="coloredBlur"/>
-                  <feMergeNode in="SourceGraphic"/>
-                </feMerge>
-              </filter>
-            </defs>
+# Two-column layout: Radar (left) + Chat (right)
+col_radar, col_chat = st.columns([1, 3])
 
-            <circle cx="150" cy="150" r="140" fill="none" stroke="#00d4e8" stroke-width="1" opacity="0.3"/>
-            <circle cx="150" cy="150" r="105" fill="none" stroke="#00d4e8" stroke-width="1" opacity="0.25"/>
-            <circle cx="150" cy="150" r="70"  fill="none" stroke="#00d4e8" stroke-width="1.5" opacity="0.35"/>
-            <circle cx="150" cy="150" r="35"  fill="none" stroke="#00d4e8" stroke-width="1" opacity="0.3"/>
+with col_radar:
+    # Image JARVIS (remplace le radar vocal)
+    st.image("assets/jarvis.png", width="stretch")
 
-            <g id="waves">
-              <circle class="wave wave-1" cx="150" cy="150" r="35"/>
-              <circle class="wave wave-2" cx="150" cy="150" r="35"/>
-              <circle class="wave wave-3" cx="150" cy="150" r="35"/>
-            </g>
+    # Controls (toggles + clear button)
+    st.markdown("<hr style='border: none; height: 1px; background: linear-gradient(90deg, transparent, rgba(45,212,255,.25), transparent);'>", unsafe_allow_html=True)
 
-            <circle class="radar-center-circle {center_cls}" cx="150" cy="150" r="28"/>
+    st.toggle("🎙️ Mode Vocal", key="mode_toggle", on_change=_on_mode_toggle)
 
-            <circle class="radar-dot" cx="150" cy="20"  r="5"/>
-            <circle class="radar-dot" cx="195" cy="37"  r="5"/>
-            <circle class="radar-dot" cx="250" cy="80"  r="5"/>
-            <circle class="radar-dot" cx="275" cy="135" r="5"/>
-            <circle class="radar-dot" cx="280" cy="150" r="5"/>
-            <circle class="radar-dot" cx="275" cy="220" r="5"/>
-            <circle class="radar-dot" cx="220" cy="270" r="5"/>
-            <circle class="radar-dot" cx="150" cy="280" r="5"/>
-            <circle class="radar-dot" cx="105" cy="263" r="5"/>
-            <circle class="radar-dot" cx="25"  cy="220" r="5"/>
-            <circle class="radar-dot" cx="20"  cy="150" r="5"/>
-            <circle class="radar-dot" cx="105" cy="37"  r="5"/>
-          </svg>
-        </div>
-        <div class="radar-status">{label}</div>
-      </div>
-      <script>
-        (() => {{
-          const container = document.querySelector('.radar-container');
-          if (!container) {{ return; }}
-          const svg = container.querySelector('svg');
-          if (!svg) {{ return; }}
-          const waves = Array.from(svg.querySelectorAll('.wave'));
-          const centerCircle = svg.querySelector('.radar-center-circle');
-          if (!waves.length || !centerCircle) {{ return; }}
+    docker_enabled_state = CFG["mcp"]["docker"].get("enabled", True)
+    st.toggle("🐳 Docker MCP", key="docker_toggle", value=docker_enabled_state)
+    CFG["mcp"]["docker"]["enabled"] = bool(st.session_state.get("docker_toggle", docker_enabled_state))
 
-          const MIN_RADIUS = 35;
-          const MAX_RADIUS = 140;
-          const BASE_CYCLE_MS = 1800;
-          const OFFSET_MS = BASE_CYCLE_MS / waves.length;
+    st.markdown("<hr style='border: none; height: 1px; background: linear-gradient(90deg, transparent, rgba(45,212,255,.25), transparent);'>", unsafe_allow_html=True)
 
-          const payload = {history_json};
-          const nowBase = performance.now();
-          const initialLevel = Math.min(Math.max(parseFloat(container.dataset.level || '0') || 0, 0), 1);
+    if st.button("🗑️ Effacer l'historique", width="stretch"):
+        st.session_state.messages = []
+        st.rerun()
 
-          let samples = Array.isArray(payload)
-            ? payload
-                .map((entry) => {{
-                  if (!entry) {{ return null; }}
-                  const lvl = Number(entry.level);
-                  const dt = Number(entry.dt);
-                  if (!Number.isFinite(lvl) || !Number.isFinite(dt)) {{ return null; }}
-                  const level = Math.min(Math.max(lvl, 0), 1);
-                  const age = Math.max(dt, 0);
-                  return {{ level, time: nowBase - age * 1000 }};
-                }})
-                .filter((item) => item !== null)
-                .sort((a, b) => a.time - b.time)
-            : [];
+with col_chat:
+    # Chat zone
+    chat_container = st.container()
 
-          if (!samples.length) {{
-            samples.push({{ level: initialLevel, time: nowBase }});
-          }}
-
-          let smoothedLevel = samples[samples.length - 1]?.level ?? initialLevel;
-          let speaking = svg.classList.contains('speaking');
-          let lastToggleTs = nowBase;
-
-          const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
-          let prefersReducedMotion = reducedMotionQuery.matches;
-
-          const handleReducedMotion = (event) => {{
-            prefersReducedMotion = event.matches;
-            if (prefersReducedMotion) {{
-              container.setAttribute('data-speaking', 'false');
-              waves.forEach((wave) => {{
-                wave.setAttribute('r', MIN_RADIUS.toString());
-                wave.style.opacity = '0';
-              }});
-              centerCircle.setAttribute('r', '28');
-            }} else {{
-              lastToggleTs = performance.now();
-            }}
-          }};
-
-          if (reducedMotionQuery.addEventListener) {{
-            reducedMotionQuery.addEventListener('change', handleReducedMotion);
-          }} else if (reducedMotionQuery.addListener) {{
-            reducedMotionQuery.addListener(handleReducedMotion);
-          }}
-
-          handleReducedMotion(reducedMotionQuery);
-
-          const levelAt = (timeMs) => {{
-            if (!samples.length) {{
-              return svg.classList.contains('speaking') ? 0.2 : 0;
-            }}
-            if (samples.length === 1) {{
-              return samples[0].level;
-            }}
-            let prev = samples[0];
-            if (timeMs <= prev.time) {{
-              return prev.level;
-            }}
-            for (let i = 1; i < samples.length; i += 1) {{
-              const sample = samples[i];
-              if (timeMs <= sample.time) {{
-                const span = Math.max(sample.time - prev.time, 1);
-                const ratio = Math.min(Math.max((timeMs - prev.time) / span, 0), 1);
-                return prev.level + (sample.level - prev.level) * ratio;
-              }}
-              prev = sample;
-            }}
-            return prev.level;
-          }};
-
-          const animate = (now) => {{
-            samples = samples.filter((sample) => now - sample.time <= 2600);
-            if (!samples.length) {{
-              samples.push({{ level: 0, time: now }});
-            }}
-
-            const rawLevel = Math.min(Math.max(levelAt(now), 0), 1);
-            smoothedLevel = smoothedLevel * 0.65 + rawLevel * 0.35;
-
-            const attrSpeaking = svg.classList.contains('speaking');
-            const speakingNow = attrSpeaking || smoothedLevel > 0.04;
-
-            if (speakingNow !== speaking) {{
-              speaking = speakingNow;
-              container.setAttribute('data-speaking', String(speaking));
-              if (speaking && !attrSpeaking) {{
-                svg.classList.add('speaking');
-              }} else {{
-                svg.classList.remove('speaking');
-              }}
-              if (speaking) {{
-                lastToggleTs = now;
-              }} else {{
-                waves.forEach((wave) => {{
-                  wave.setAttribute('r', MIN_RADIUS.toString());
-                  wave.style.opacity = '0';
-                }});
-              }}
-            }}
-
-            const visualLevel = smoothedLevel > 0.015 ? smoothedLevel : (speakingNow ? 0.12 : 0);
-            const cycleMs = speakingNow ? BASE_CYCLE_MS * (1 - Math.min(visualLevel, 0.6) * 0.35) : BASE_CYCLE_MS * 1.1;
-
-            waves.forEach((wave, index) => {{
-              const elapsed = now - lastToggleTs - index * OFFSET_MS;
-              if (!speakingNow || elapsed < 0) {{
-                wave.setAttribute('r', MIN_RADIUS.toString());
-                wave.style.opacity = '0';
-                return;
-              }}
-
-              const progress = (elapsed % cycleMs) / cycleMs;
-              const maxRadius = MIN_RADIUS + (MAX_RADIUS - MIN_RADIUS) * visualLevel;
-              const radius = MIN_RADIUS + (maxRadius - MIN_RADIUS) * progress;
-              const opacity = Math.max(0, (1 - progress) * (0.35 + visualLevel * 0.55));
-
-              wave.setAttribute('r', radius.toFixed(2));
-              wave.style.opacity = opacity.toFixed(2);
-            }});
-
-            const centerRadius = 28 + visualLevel * 10;
-            centerCircle.setAttribute('r', centerRadius.toFixed(2));
-
-            requestAnimationFrame(animate);
-          }};
-
-          requestAnimationFrame(animate);
-        }})();
-      </script>
-    </body>
-    </html>
-    """
-    components.html(html_snippet, height=480, scrolling=False)
-
-# -------------- Tabs --------------
-tab_interface, tab_settings = st.tabs(["🎛️ Interface", "⚙️ Settings"])
-
-# -------------------- Interface (Chat) --------------------
-with tab_interface:
-    now_ts = time.time()
-    last_ts = st.session_state.get("last_assistant_ts", 0.0)
-    recent_assistant = last_ts and (now_ts - last_ts) < 6
-    speaking = bool(recent_assistant)
-    st.session_state.assistant_speaking = speaking
-
-    mode = st.session_state.get("interaction_mode", "chat")
-
-    c1, c2 = st.columns([3, 9])
-    with c1:
-        render_radar(
-            speaking=speaking,
-            mode=mode,
-            vu_history=st.session_state.get("assistant_vu_history", []),
-        )
-
-    with c2:
-        msgs = st.session_state.setdefault("messages", [])
-
-        # ---- Rendu du chat (seulement user/assistant)
-        def _render_messages(messages: List[Dict[str, str]]) -> str:
-            display = [m for m in (messages or []) if m.get("role") in ("user", "assistant")]
-            if not display:
-                return (
-                    '<div class="msgs" id="chatMsgs"><div class="bubble assistant muted">'
-                    "Aucun échange pour le moment."
-                    "</div></div>"
-                )
-            bubbles = []
-            for msg in display:
-                role = msg.get("role", "assistant")
-                content = msg.get("content", "")
-                cls = "bubble assistant" if role != "user" else "bubble user"
-                safe_content = html.escape(str(content))
-                safe_content = re.sub(
-                    r'(https?://[^\s<>"\')]+?)(?=[\s<>"\')]|[.,!?;:)](?:\s|$)|$)',
-                    r'<a href="\g<1>" target="_blank" rel="noopener noreferrer">\g<1></a>',
-                    safe_content,
-                )
-                safe_content = safe_content.replace("\n", "<br />")
-                bubbles.append(f'<div class="{cls}">{safe_content}</div>')
-            return f"<div class='msgs' id='chatMsgs'>{''.join(bubbles)}</div>"
-
-        chat_slot = st.empty()
-        chat_slot.markdown(
-            f'''
-            <div class="card chat-card">
-              <div class="chat-card-body">
-                <h3>Chat</h3>
-                <div class="chat-wrap">
-                  {_render_messages(msgs)}
-                </div>
-              </div>
-            </div>
-            ''',
-            unsafe_allow_html=True
-        )
-
-        # --- Ligne d'entrée : textarea (gauche) + toggles (droite)
-        input_cols = st.columns([11, 1])
-
-        # Colonne droite : toggles HORS formulaire (sinon erreur Streamlit)
-        with input_cols[1]:
-            # st.write("")  # spacer pour alignement vertical
-            st.toggle("🎙️ Vocal", key="mode_toggle", on_change=_on_mode_toggle)
-            gw_enabled_state = CFG["mcp"]["gateway"].get("enabled", True)
-            st.toggle("🌐 MCP", key="gateway_toggle", value=gw_enabled_state, help=None)  # <- renommé
-            # Sync session/config sans callback (évite l'erreur dans les forms)
-            CFG["mcp"]["gateway"]["enabled"] = bool(st.session_state.get("gateway_toggle", gw_enabled_state))
-            # sif bool(st.session_state.get("mode_toggle", False)) != (st.session_state.get("interaction_mode") == "vocal"):
-            # s    _sync_mode_from_toggle()
-
-        # Colonne gauche : formulaire de saisie avec bouton à droite (icône)
-        with input_cols[0]:
-            mode = st.session_state.interaction_mode
-            placeholder_text = (
-                "MODE VOCAL ACTIVÉ - Utilise ton micro"
-                if mode == "vocal"
-                else "Écris un message (/tool nom {json}, /web requête, /fetch URL)"
+    with chat_container:
+        # Render messages with JARVIS style
+        if st.session_state.messages:
+            st.markdown(
+                render_chat_messages(
+                    st.session_state.messages[-50:],
+                    username=st.session_state.username
+                ),
+                unsafe_allow_html=True
             )
-            with st.form("chat_form", clear_on_submit=True, border=False):
-                inner_cols = st.columns([20, 1], vertical_alignment="bottom")
-                with inner_cols[0]:
-                    user_text = st.text_area(
-                        "Message",
-                        key="chat_input",
-                        placeholder=placeholder_text,
-                        height=40,
-                        label_visibility="collapsed",
-                        disabled=(mode == "vocal"),
-                    )
-                with inner_cols[1]:
-                    submitted = st.form_submit_button(
-                        "📨",                   # <- icône d’envoi
-                        use_container_width=True,
-                        help="Envoyer",
-                        disabled=(mode != "chat"),
-                    )
+        else:
+            st.markdown(
+                render_chat_messages([], username=st.session_state.username),
+                unsafe_allow_html=True
+            )
 
-        if submitted and mode == "chat":
-            clean_text = (user_text or "").strip()
-            if clean_text:
-                # Affiche tout de suite le message user + placeholder assistant "…"
-                st.session_state["messages"].append({"role": "user", "content": clean_text})
+    # Input zone at bottom
+    st.markdown("<br>", unsafe_allow_html=True)
 
-                use_stream = bool(CFG["ollama"].get("stream")) and not bool(CFG["llm"].get("use_ollama_tools", True))
-                if not use_stream:
-                    st.session_state["messages"].append({"role": "assistant", "content": "…"})
-                    chat_slot.markdown(
-                        f'''
-                        <div class="card chat-card">
-                          <div class="chat-card-body">
-                            <h3>Chat</h3>
-                            <div class="chat-wrap">
-                              {_render_messages(st.session_state["messages"][-200:])}
-                            </div>
-                          </div>
-                        </div>
-                        ''',
-                        unsafe_allow_html=True
-                    )
+    mode = st.session_state.interaction_mode
+    placeholder_text = (
+        "🎙️ MODE VOCAL ACTIF"
+        if mode == "vocal"
+        else "Écris un message (/tool nom {json}, /web requête, /fetch URL)"
+    )
 
-                if use_stream:
-                    # Streaming (sans tools)
-                    st.session_state["messages"].append({"role": "assistant", "content": ""})
+    with st.form("chat_form", clear_on_submit=True):
+        cols = st.columns([10, 1])
 
-                    def _on_delta(tok: str):
-                        st.session_state["messages"][-1]["content"] += tok
-                        msgs_live = st.session_state["messages"][-200:]
-                        chat_slot.markdown(
-                            f'''
-                            <div class="card chat-card">
-                              <div class="chat-card-body">
-                                <h3>Chat</h3>
-                                <div class="chat-wrap">
-                                  {_render_messages(msgs_live)}
-                                </div>
-                              </div>
-                            </div>
-                            ''',
-                            unsafe_allow_html=True
-                        )
+        with cols[0]:
+            user_input = st.text_area(
+                "Message",
+                placeholder=placeholder_text,
+                height=45,
+                label_visibility="collapsed",
+                disabled=(mode == "vocal"),
+                key="user_input"
+            )
 
-                    try:
-                        _apply_env_from_cfg(CFG)
-                        ctx_msgs = st.session_state["messages"][-20:]
-                        _ = ollama_stream_chat(CFG, ctx_msgs, _on_delta)
-                    except Exception as e:
-                        st.session_state["messages"][-1]["content"] = f"(Erreur stream Ollama: {e})"
+        with cols[1]:
+            submitted = st.form_submit_button(
+                "📨",
+                width="stretch",
+                help="Envoyer le message",
+                disabled=(mode == "vocal")
+            )
 
-                else:
-                    # Traitement normal (tools/auto-web/LLM)
-                    process_user_text(clean_text, origin="chat", already_appended=True)
-                    # Retirer le placeholder "…"
-                    msgs_now = st.session_state.get("messages", [])
-                    for i in range(len(msgs_now)-1, -1, -1):
-                        if msgs_now[i].get("role") == "assistant" and msgs_now[i].get("content") == "…":
-                            msgs_now.pop(i)
-                            break
-                    st.session_state["messages"] = msgs_now
+    if submitted and user_input and user_input.strip() and mode == "chat":
+        clean_text = user_input.strip()
 
-                # Repeindre le chat
-                chat_slot.markdown(
-                    f'''
-                    <div class="card chat-card">
-                      <div class="chat-card-body">
-                        <h3>Chat</h3>
-                        <div class="chat-wrap">
-                          {_render_messages(st.session_state["messages"][-200:])}
-                        </div>
-                      </div>
-                    </div>
-                    ''',
-                    unsafe_allow_html=True
-                )
+        # Ajouter le message utilisateur
+        st.session_state["messages"].append({"role": "user", "content": clean_text})
 
-        # if mode == "vocal":
-        #     st.info("Mode vocal actif : Jarvis répondra via la voix lorsque le backend est connecté.")
+        # Process the message AVANT tout rerun
+        process_user_text(clean_text, origin="chat", already_appended=True)
 
-        # Pompe live des logs si Jarvis tourne
-        if st.session_state.get("jarvis_running"):
-            mode = st.session_state.get("interaction_mode", "chat")
-            idle_timeout = 120.0 if mode == "vocal" else 6.0
-            poll_interval = 0.10 if mode == "vocal" else 0.15
-            last_activity = time.time()
+        # Remove placeholder "…" (ajouté par process_user_text si nécessaire)
+        msgs_now = st.session_state.get("messages", [])
+        for i in range(len(msgs_now)-1, -1, -1):
+            if msgs_now[i].get("role") == "assistant" and msgs_now[i].get("content") == "…":
+                msgs_now.pop(i)
+                break
+        st.session_state["messages"] = msgs_now
 
-            while True:
-                logs = drain_jarvis_logs()
-                if logs:
-                    _update_speaking_state_from_logs(logs)
-                    _ingest_chat_from_logs(logs, rerun=False)
-                    last_activity = time.time()
+        st.rerun()
 
-                    msgs_live = st.session_state.get("messages", [])
-                    chat_slot.markdown(
-                        f'''
-                        <div class="card chat-card">
-                          <div class="chat-card-body">
-                            <h3>Chat</h3>
-                            <div class="chat-wrap">
-                              {_render_messages(msgs_live)}
-                            </div>
-                          </div>
-                        </div>
-                        ''',
-                        unsafe_allow_html=True
-                    )
+    # Poll logs if Jarvis is running
+    if st.session_state.get("jarvis_running"):
+        mode = st.session_state.get("interaction_mode", "chat")
+        idle_timeout = 120.0 if mode == "vocal" else 6.0
+        poll_interval = 0.10 if mode == "vocal" else 0.15
+        last_activity = time.time()
 
-                assembling = bool(st.session_state.get("_assembling_assistant", False))
-                if (time.time() - last_activity > idle_timeout) and not assembling:
-                    break
+        while True:
+            logs = drain_jarvis_logs()
+            if logs:
+                _update_speaking_state_from_logs(logs)
+                _ingest_chat_from_logs(logs, rerun=False)
+                last_activity = time.time()
+                st.rerun()
 
-                time.sleep(poll_interval)
+            assembling = bool(st.session_state.get("_assembling_assistant", False))
+            if (time.time() - last_activity > idle_timeout) and not assembling:
+                break
 
-# -------------------- Settings --------------------
-with tab_settings:
-    t0, t1, t2, t3, t4, t5 = st.tabs(["Jarvis", "Whisper", "Piper", "Ollama", "MCP", "💾 Sauvegarde"])
+            time.sleep(poll_interval)
 
-    with t0:
-        st.write("**Jarvis (audio local)**")
+# =============================================================================
+# SIDEBAR - SETTINGS (like in demo)
+# =============================================================================
+
+@st.cache_data(ttl=60)
+def get_ollama_models(host: str):
+    """Wrapper around fetch_ollama_models with caching"""
+    return fetch_ollama_models(host)
+
+@st.cache_data
+def get_piper_voices(base_dir: str = "~/.jarvis/voices"):
+    """Get list of Piper voices"""
+    try:
+        voice_dir = Path(base_dir).expanduser()
+        if voice_dir.exists():
+            voices = list(voice_dir.glob("*.onnx"))
+            return [str(v) for v in voices] if voices else ["~/.jarvis/voices/fr_FR-siwis-medium.onnx"]
+        return ["~/.jarvis/voices/fr_FR-siwis-medium.onnx"]
+    except:
+        return ["~/.jarvis/voices/fr_FR-siwis-medium.onnx"]
+
+with st.sidebar:
+    st.markdown("### ⚙️ Configuration")
+
+    # ---- Jarvis Backend ----
+    with st.expander("🎙️ Jarvis (Backend)", expanded=False):
         current_path = CFG["jarvis"].get("path", "./jarvis.py")
         jarvis_path = st.text_input("Chemin jarvis.py", value=current_path)
         CFG["jarvis"]["path"] = jarvis_path.strip() or current_path
+
         CFG["jarvis"]["audio_out"] = st.text_input(
             "Préférence sortie audio (AUDIO_OUT)",
             value=CFG["jarvis"].get("audio_out", "analog"),
             help="Chaîne partielle du nom du périphérique (ex: analog, speaker, hdmi). Laisser vide pour auto.",
         ).strip()
 
-        ctts1, ctts2 = st.columns(2)
-        with ctts1:
-            tts_options = ["piper", "fallback"]
-            current_engine = CFG["jarvis"].get("tts_engine", "piper")
-            idx_engine = tts_options.index(current_engine) if current_engine in tts_options else 0
-            CFG["jarvis"]["tts_engine"] = st.selectbox("Moteur TTS", tts_options, index=idx_engine)
-        with ctts2:
-            CFG["jarvis"]["tts_lang"] = st.text_input(
-                "Langue TTS (fallback)", value=CFG["jarvis"].get("tts_lang", "fr")
-            ).strip() or "fr"
+        tts_options = ["piper", "fallback"]
+        current_engine = CFG["jarvis"].get("tts_engine", "piper")
+        idx_engine = tts_options.index(current_engine) if current_engine in tts_options else 0
+        CFG["jarvis"]["tts_engine"] = st.selectbox("Moteur TTS", tts_options, index=idx_engine)
 
-        st.markdown("---")
-        wake_col1, wake_col2 = st.columns(2)
-        with wake_col1:
-            CFG["jarvis"]["wake_word"] = st.text_input(
-                "Mot d'activation principal", value=CFG["jarvis"].get("wake_word", "jarvis")
-            ).strip() or "jarvis"
-            CFG["jarvis"]["require_wake"] = st.checkbox(
-                "Nécessite le mot-clé pour écouter",
-                value=bool(CFG["jarvis"].get("require_wake", True)),
-            )
-        with wake_col2:
-            CFG["jarvis"]["wake_fuzzy"] = st.checkbox(
-                "Tolérance phonétique (RapidFuzz)",
-                value=bool(CFG["jarvis"].get("wake_fuzzy", True)),
-            )
-            CFG["jarvis"]["wake_fuzzy_score"] = st.slider(
-                "Score fuzzy minimal",
-                50,
-                100,
-                int(CFG["jarvis"].get("wake_fuzzy_score", 80)),
-            )
+        CFG["jarvis"]["tts_lang"] = st.text_input(
+            "Langue TTS (fallback)", value=CFG["jarvis"].get("tts_lang", "fr")
+        ).strip() or "fr"
+
+        CFG["jarvis"]["wake_word"] = st.text_input(
+            "Mot d'activation",
+            value=CFG["jarvis"].get("wake_word", "jarvis"),
+        ).strip() or "jarvis"
+
+        CFG["jarvis"]["require_wake"] = st.checkbox(
+            "Nécessite mot d'activation",
+            value=bool(CFG["jarvis"].get("require_wake", True)),
+        )
+
+        CFG["jarvis"]["wake_fuzzy_score"] = st.slider(
+            "Score fuzzy matching",
+            0, 100,
+            CFG["jarvis"].get("wake_fuzzy_score", 80),
+            5,
+            help="Tolérance pour la détection du mot (80 = bon équilibre)"
+        )
 
         CFG["jarvis"]["wake_aliases"] = st.text_area(
             "Alias supplémentaires (un par ligne ou séparés par des virgules)",
@@ -2038,238 +1515,232 @@ with tab_settings:
             height=80,
         ).strip()
 
-        colJ1, colJ2, colJ3 = st.columns(3)
-        with colJ1:
-            if st.button("▶️ Démarrer Jarvis"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("▶️ Démarrer"):
                 start_jarvis(CFG)
-        with colJ2:
-            if st.button("⏹️ Arrêter Jarvis"):
+        with col2:
+            if st.button("⏹️ Arrêter"):
                 stop_jarvis()
-        with colJ3:
-            if st.button("♻️ Recharger module"):
+        with col3:
+            if st.button("♻️ Recharger"):
                 st.session_state.jarvis_mod = None
-                st.success("Module Jarvis sera rechargé au prochain démarrage.")
+                st.success("Module rechargé.")
 
         if st.session_state.jarvis_running:
             drain_jarvis_logs()
         st.code("\n".join(st.session_state.get("jarvis_logbuf", [])) or "—", language="bash")
 
-        st.caption("Astuce: si l’audio sort au mauvais endroit, mets AUDIO_OUT sur une sous-chaîne du nom du périphérique (ex: 'analog', 'hdmi').")
+    # ---- Whisper (STT) ----
+    with st.expander("🎤 Whisper (STT)", expanded=False):
+        whisper_models = ["tiny", "base", "small", "medium", "large"]
+        current_whisper = CFG["whisper"]["model"]
+        whisper_idx = whisper_models.index(current_whisper) if current_whisper in whisper_models else 2
 
-    with t1:
-        model_options = ["tiny", "base", "small", "medium", "large-v3"]
-        current_model = CFG["whisper"].get("model", "small")
-        if current_model not in model_options:
-            current_model = "small"
         CFG["whisper"]["model"] = st.selectbox(
-            "Modèle Fast Whisper", model_options, index=model_options.index(current_model)
+            "Modèle Whisper",
+            whisper_models,
+            index=whisper_idx
         )
 
-        lang_options = ["fr", "en", "auto"]
-        current_lang = CFG["whisper"].get("lang", "fr")
-        if current_lang not in lang_options:
-            current_lang = "fr"
-        CFG["whisper"]["lang"] = st.selectbox("Langue", lang_options, index=lang_options.index(current_lang))
+        CFG["whisper"]["lang"] = st.text_input(
+            "Langue",
+            value=CFG["whisper"]["lang"]
+        )
 
-        CFG["whisper"]["vad"] = st.checkbox("VAD activé", value=bool(CFG["whisper"].get("vad", True)))
+        CFG["whisper"]["vad"] = st.checkbox(
+            "VAD (Voice Activity Detection)",
+            value=CFG["whisper"]["vad"]
+        )
 
         device_options = ["cpu", "cuda"]
-        current_device = CFG["whisper"].get("device", "cpu")
-        if current_device not in device_options:
-            current_device = "cpu"
+        device_idx = device_options.index(CFG["whisper"]["device"]) if CFG["whisper"]["device"] in device_options else 0
         CFG["whisper"]["device"] = st.selectbox(
-            "Device", device_options, index=device_options.index(current_device)
+            "Device",
+            device_options,
+            index=device_idx
         )
 
-        compute_options = ["int8", "int8_float16", "float16", "float32"]
-        current_compute = CFG["whisper"].get("compute", "int8")
-        if current_compute not in compute_options:
-            current_compute = "int8"
+        compute_options = ["int8", "float16", "float32"]
+        compute_idx = compute_options.index(CFG["whisper"]["compute"]) if CFG["whisper"]["compute"] in compute_options else 0
         CFG["whisper"]["compute"] = st.selectbox(
-            "Compute", compute_options,
-            index=compute_options.index(current_compute) if current_compute in compute_options else 0
+            "Compute Type",
+            compute_options,
+            index=compute_idx
         )
 
-        CFG["whisper"]["prompt"] = st.text_area(
-            "Prompt initial (contexte)",
-            value=CFG["whisper"].get("prompt", ""),
-            height=100,
-        ).strip()
+    # ---- Piper (TTS) ----
+    with st.expander("🗣️ Piper (TTS)", expanded=False):
+        voices = get_piper_voices()
+        current_voice = CFG["piper"]["voice"]
+        voice_idx = voices.index(current_voice) if current_voice in voices else 0
 
-    with t2:
-        st.write("**Sélection de la voix Piper**")
-        CFG["piper"]["base_dir"] = st.text_input(
-            "Dossier des voix (local serveur)",
-            value=str(CFG["piper"].get("base_dir", "")),
-        ).strip()
-        up1, up2 = st.columns(2)
-        with up1:
-            up_onnx = st.file_uploader("Voice ONNX", type=["onnx"], accept_multiple_files=False, key="up_onnx")
-            if up_onnx:
-                saved = save_uploaded(up_onnx, CFG["piper"]["base_dir"])
-                if saved:
-                    st.success(f"Enregistré : {saved}")
-        with up2:
-            up_json = st.file_uploader("Voice JSON (optionnel)", type=["json"], accept_multiple_files=False, key="up_json")
-            if up_json:
-                saved = save_uploaded(up_json, CFG["piper"]["base_dir"])
-                if saved:
-                    st.success(f"Enregistré : {saved}")
-        voice_files = []
-        try:
-            if os.path.isdir(CFG["piper"]["base_dir"]):
-                voice_files = [f for f in os.listdir(CFG["piper"]["base_dir"]) if f.endswith(".onnx")]
-        except Exception as e:
-            st.warning(f"Dossier inaccessible: {e}")
-        sel_list = [""] + voice_files
-        idx_sel = sel_list.index(CFG["piper"].get("voice","")) if CFG["piper"].get("voice","") in sel_list else 0
-        sel = st.selectbox("Choisir une voix", sel_list, index=idx_sel)
-        CFG["piper"]["voice"] = sel
-        colP1, colP2 = st.columns(2)
-        with colP1:
-            CFG["piper"]["speaker_id"] = st.number_input("Speaker ID", min_value=0, max_value=999, value=int(CFG["piper"].get("speaker_id", 0)), step=1)
-            CFG["piper"]["use_cuda"] = st.toggle("Activer CUDA (--cuda)", value=bool(CFG["piper"].get("use_cuda", False)))
-        with colP2:
-            CFG["piper"]["speed"] = st.number_input("Vitesse (length scale)", min_value=0.5, max_value=2.0, value=float(CFG["piper"].get("speed", 0.9)), step=0.05)
-
-        CFG["piper"]["noise"] = st.slider("Noise scale", 0.0, 2.0, float(CFG["piper"].get("noise", 0.667)), 0.01)
-        CFG["piper"]["noise_w"] = st.slider("Noise width", 0.0, 2.0, float(CFG["piper"].get("noise_w", 0.8)), 0.01)
-        CFG["piper"]["sentence_silence"] = st.slider("Silence inter-phrases (s)", 0.0, 1.0, float(CFG["piper"].get("sentence_silence", 0.10)), 0.01)
-
-    with t3:
-        st.write("**Ollama**")
-        CFG["ollama"]["host"] = st.text_input("Host", value=CFG["ollama"]["host"])
-        models = fetch_ollama_models(CFG["ollama"]["host"])
-        if models:
-            idx = models.index(CFG["ollama"]["model"]) if CFG["ollama"]["model"] in models else 0
-            CFG["ollama"]["model"] = st.selectbox("Modèle local installé", models, index=idx)
-        else:
-            CFG["ollama"]["model"] = st.text_input("Modèle (texte libre)", value=CFG["ollama"]["model"])
-            st.warning("Aucun modèle listé — Ollama indisponible ? (ou vide)")
-
-        CFG["ollama"]["temperature"] = st.slider("Température", 0.0, 1.5, float(CFG["ollama"]["temperature"]), 0.05)
-        CFG["ollama"]["num_ctx"] = st.number_input("Contexte (num_ctx)", 512, 16384, int(CFG["ollama"]["num_ctx"]), 512)
-        CFG["ollama"]["stream"] = st.toggle("Streaming tokens (mode chat sans tools)", value=bool(CFG["ollama"]["stream"]))
-        st.markdown("---")
-        st.write("**Prompt & Agent**")
-        CFG.setdefault("llm", {})
-        CFG["llm"]["system_prompt"] = st.text_area(
-            "Texte injecté au début de chaque conversation (rôle system)",
-            value=CFG["llm"].get("system_prompt", ""),
-            height=220,
-            help="Décris le rôle, l’usage des tools MCP et le style de réponse."
+        CFG["piper"]["voice"] = st.selectbox(
+            "Voix Piper",
+            voices,
+            index=voice_idx,
+            help="Fichiers .onnx dans ~/.jarvis/voices"
         )
-        cols_agent = st.columns(4)
-        with cols_agent[0]:
-            CFG["llm"]["use_ollama_tools"] = st.toggle(
-                "⚒️ Tool-calling natif (reco.)",
-                value=bool(CFG["llm"].get("use_ollama_tools", True)),
-                help="Passe la liste des tools au modèle et exécute automatiquement les tool_calls."
-            )
-        with cols_agent[1]:
-            CFG["llm"]["agent_max_rounds"] = st.number_input(
-                "Boucles max agent",
-                min_value=1, max_value=8,
-                value=int(CFG["llm"].get("agent_max_rounds", 3)),
-                step=1
-            )
-        with cols_agent[2]:
-            CFG["llm"]["agent_enabled"] = st.toggle(
-                "Heuristique bloc JSON (legacy)",
-                value=bool(CFG["llm"].get("agent_enabled", False)),
-                help="Détecte un ```json``` dans le texte du modèle."
-            )
-        with cols_agent[3]:
-            CFG["llm"]["selector_json"] = st.toggle(
-                "Sélecteur JSON manuel (legacy)",
-                value=bool(CFG["llm"].get("selector_json", False)),
-                help="Ancien flux: forcer une sélection d’outil via format JSON."
-            )
 
-        st.markdown("---")
-        colA, colB, colC, colD = st.columns(4)
-        with colA:
-            if st.button("Tester connexion"):
-                st.info("Connexion à /api/tags…")
-                ok = is_ollama_up(CFG["ollama"]["host"])
-                st.success("OK") if ok else st.error("KO")
-        with colB:
-            if st.button("Démarrer Ollama (serve)"):
-                log_path = os.path.join(CONFIG_DIR, "ollama_serve.log")
-                ok = start_ollama_daemon(log_path=log_path)
-                if ok:
-                    st.info("Démarré. Attente de disponibilité…")
-                    if wait_ollama_ready(CFG["ollama"]["host"], seconds=12):
-                        st.success("Ollama prêt.")
-                    else:
-                        st.warning("Toujours indisponible. Vérifie les logs: " + log_path)
-        with colC:
-            if st.button("Pull modèle sélectionné"):
-                model = CFG["ollama"]["model"]
-                if not model:
-                    st.error("Aucun modèle sélectionné.")
+        CFG["piper"]["speed"] = st.slider(
+            "Vitesse (length_scale)",
+            0.5, 1.5,
+            CFG["piper"]["speed"],
+            0.05
+        )
+
+        CFG["piper"]["noise"] = st.slider(
+            "Noise Scale",
+            0.0, 1.0,
+            CFG["piper"]["noise"],
+            0.01
+        )
+
+        CFG["piper"]["noise_w"] = st.slider(
+            "Noise W",
+            0.0, 1.0,
+            CFG["piper"]["noise_w"],
+            0.01
+        )
+
+        CFG["piper"]["sentence_silence"] = st.slider(
+            "Silence entre phrases (s)",
+            0.0, 0.5,
+            CFG["piper"]["sentence_silence"],
+            0.01
+        )
+
+        CFG["piper"]["use_cuda"] = st.checkbox(
+            "Utiliser CUDA (GPU)",
+            value=CFG["piper"]["use_cuda"],
+            help="⚠️ Nécessite onnxruntime-gpu"
+        )
+
+    # ---- Ollama (LLM) ----
+    with st.expander("🧠 Ollama (LLM)", expanded=False):
+        CFG["ollama"]["host"] = st.text_input(
+            "Host Ollama",
+            value=CFG["ollama"]["host"]
+        )
+
+        # Get models list
+        models = get_ollama_models(CFG["ollama"]["host"])
+        current_model = CFG["ollama"]["model"]
+
+        # Add current model if not in list
+        if current_model not in models:
+            models.append(current_model)
+
+        model_idx = models.index(current_model) if current_model in models else 0
+
+        CFG["ollama"]["model"] = st.selectbox(
+            "Modèle LLM",
+            models,
+            index=model_idx,
+            help="Modèles installés sur Ollama"
+        )
+
+        # Refresh button
+        if st.button("🔄 Rafraîchir les modèles"):
+            st.cache_data.clear()
+            st.rerun()
+
+        CFG["ollama"]["temperature"] = st.slider(
+            "Température",
+            0.0, 2.0,
+            CFG["ollama"]["temperature"],
+            0.05,
+            help="Créativité: 0 = déterministe, 2 = très créatif"
+        )
+
+        CFG["ollama"]["num_ctx"] = st.number_input(
+            "Context Window",
+            min_value=512,
+            max_value=32768,
+            value=CFG["ollama"]["num_ctx"],
+            step=512,
+            help="Nombre de tokens de contexte"
+        )
+
+        CFG["ollama"]["stream"] = st.checkbox(
+            "Mode Streaming",
+            value=CFG["ollama"]["stream"],
+            help="Afficher les tokens au fur et à mesure"
+        )
+
+    # ---- Docker MCP Toolkit ----
+    with st.expander("🐳 Docker MCP Toolkit", expanded=False):
+        st.markdown("""
+        **Docker MCP Toolkit** : Système MCP natif avec isolation par conteneurs.
+        - Serveurs installés : `context7`, `fetch`, `mcp-python-refactoring`, `time`
+        - Communication via `docker mcp gateway run` (stdio)
+        """)
+
+        CFG["mcp"]["docker"]["enabled"] = st.checkbox(
+            "Docker MCP activé",
+            value=CFG["mcp"]["docker"]["enabled"],
+            help="Active le Docker MCP Toolkit pour accéder aux serveurs MCP containerisés"
+        )
+
+        CFG["mcp"]["docker"]["docker_cmd"] = st.text_input(
+            "Commande Docker",
+            value=CFG["mcp"]["docker"]["docker_cmd"],
+            help="Chemin vers la commande docker (par défaut: 'docker')"
+        )
+
+        # Afficher la liste des serveurs MCP installés
+        if st.button("🔍 Lister les serveurs MCP"):
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["docker", "mcp", "server", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    st.success(f"**Serveurs installés:**\n```\n{result.stdout}\n```")
                 else:
-                    pull_model(model)
-        with colD:
-            if st.button("Warm-up modèle"):
-                model = CFG["ollama"]["model"]
-                if not model:
-                    st.error("Aucun modèle sélectionné.")
-                else:
-                    ok = warmup_model(CFG["ollama"]["host"], model)
-                    st.success("Chargé") if ok else st.error("Échec warm-up")
+                    st.error(f"Erreur: {result.stderr}")
+            except Exception as e:
+                st.error(f"Docker MCP non disponible: {e}")
 
-    with t4:
-        st.write("**MCP (via MCPJungle Gateway)**")
-        mcp_installed = _mcp_import_ok()
-        if not mcp_installed:
-            st.info("Installe le SDK MCP: `pip install mcp` (ou `pip install modelcontextprotocol`).")
-
-        CFG["mcp"]["gateway"]["enabled"] = st.toggle(
-            "Activer MCPJungle",
-            value=bool(CFG["mcp"]["gateway"].get("enabled", True))
-        )
-        CFG["mcp"]["gateway"]["base_url"]  = st.text_input(
-            "Gateway URL", value=CFG["mcp"]["gateway"].get("base_url","http://127.0.0.1:8080")
-        )
-        CFG["mcp"]["gateway"]["auth_header"] = st.text_input(
-            "Authorization (optionnel)", value=CFG["mcp"]["gateway"].get("auth_header",""), placeholder="Bearer xxx"
+        CFG["mcp"]["docker"]["auto_web"] = st.checkbox(
+            "Auto Web Search",
+            value=CFG["mcp"]["docker"]["auto_web"],
+            help="Activer la recherche web automatique"
         )
 
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("🔍 Lister tools (Gateway)"):
-                try:
-                    tools = mcp_list_tools_full_via_gateway()
-                    if tools:
-                        preview = "\n".join([f"- {t['name']}: {t.get('description','')}" for t in tools])
-                        st.success(preview[:3000] if len(preview) > 3000 else preview)
-                    else:
-                        st.info("(aucun)")
-                except Exception as e:
-                    st.error(f"list_tools: {e}")
-        with colB:
-            with st.popover("▶️ Appeler un tool (Gateway)"):
-                tname = st.text_input("Nom du tool", placeholder="ex: ddg__search")
-                targ  = st.text_area("Arguments (JSON)", placeholder='{"query":"paris", "max_results": 5}', height=120)
-                if st.button("Exécuter"):
-                    try:
-                        args = json.loads(targ) if targ.strip() else {}
-                        out = mcp_call_tool_via_gateway(tname.strip(), args, timeout_s=60)
-                        st.code(out or "(vide)")
-                    except Exception as e:
-                        st.error(f"call_tool: {e}")
+        CFG["mcp"]["docker"]["chat_shortcuts"] = st.checkbox(
+            "Raccourcis chat (/web, /fetch, /tool)",
+            value=CFG["mcp"]["docker"]["chat_shortcuts"],
+            help="Active les commandes rapides dans le chat"
+        )
 
-        st.caption("Raccourci chat:  `/tool <nom> {json}`  — se connecte au gateway MCPJungle.")
-        st.caption("Raccourcis web:  `/web requête…`  et  `/fetch URL`  (via ddg__search / ddg__fetch_content).")
+    st.markdown("<hr style='border: none; height: 1px; background: linear-gradient(90deg, transparent, rgba(45,212,255,.25), transparent);'>", unsafe_allow_html=True)
 
-    with t5:
-        csa, csb = st.columns(2)
-        with csa:
-            if st.button("💾 Enregistrer la configuration"):
-                save_cfg(CFG)
-        with csb:
-            if st.button("↩️ Recharger depuis disque"):
-                st.cache_data.clear()
-                st.rerun()
+    # Save button
+    if st.button("💾 Sauvegarder la config", width="stretch"):
+        save_cfg(CFG)
+        st.info(f"📊 Modèle actuel: {CFG['ollama']['model']}")
 
+    st.markdown("<hr style='border: none; height: 1px; background: linear-gradient(90deg, transparent, rgba(45,212,255,.25), transparent);'>", unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="text-align: center; padding: 20px; opacity: 0.6;">
+        <p style="font-size: 12px; letter-spacing: 0.1em;">
+            J.A.R.V.I.S. v2.0<br>
+            Architecture Hybride CPU/GPU<br>
+            © 2025
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Footer
+st.markdown("""
+<div style="text-align: center; padding: 40px 20px; opacity: 0.4;">
+    <p style="font-size: 12px; letter-spacing: 0.15em; text-transform: uppercase;">
+        Powered by Ollama · Whisper · Piper TTS
+    </p>
+</div>
+""", unsafe_allow_html=True)

@@ -1,24 +1,191 @@
 # Analyse du dépôt Streamlit_JARVIS
 
-## Problèmes critiques à corriger
+**Date de dernière mise à jour :** 3 novembre 2025
+**Statut :** ✅ Tous les problèmes critiques ont été corrigés
 
-1. **Configuration par défaut mutée en mémoire**  
-   `load_cfg()` part d'une copie superficielle de `DEFAULT_CFG`. Les sous-dictionnaires (`mcp`, `piper`, etc.) restent donc partagés avec l'original, puis `_normalize_mcp_servers()` ré-écrit ces structures sur place. Résultat : la première lecture de config modifie aussi `DEFAULT_CFG`, ce qui change les valeurs par défaut pour la session suivante ou pour tout utilisateur qui n'a pas encore de fichier `ui_config.json`. 【F:app.py†L69-L149】
+---
 
-2. **Proxy MCP inexploitable par défaut**  
-   Le proxy activé par défaut pointe vers `node /ABSOLU/adamwattis_mcp-proxy-server/build/index.js`. Ce chemin n'existe pas dans le dépôt ni dans une installation standard, provoquant un échec systématique dès que l'utilisateur tente d'utiliser les raccourcis MCP. 【F:app.py†L40-L52】
+## ✅ Problèmes corrigés
 
-3. **Dépendances Ollama/Piper impossibles à installer sur CPU**  
-   Le fichier `requirements.txt` exige à la fois `onnxruntime` (CPU) et `onnxruntime-gpu`. Ces paquets fournissent les mêmes modules et entrent en conflit : l'installation échoue ou tente de charger CUDA (`libcuda.so`) sur des machines qui n'en disposent pas. Il faut choisir une variante selon la cible matérielle, pas les deux. 【F:requirements.txt†L1-L15】
+### 1. ✅ Configuration par défaut mutée en mémoire - **RÉSOLU**
 
-## Risques de sécurité
+**Problème initial :**
+`load_cfg()` utilisait une copie superficielle de `DEFAULT_CFG`. Les sous-dictionnaires (`mcp`, `piper`, etc.) restaient partagés avec l'original, et la normalisation ré-écrivait ces structures sur place, modifiant ainsi `DEFAULT_CFG` en mémoire.
 
-- **Création de fichiers temporaires non sécurisée**  
-  `write_wav_tmp()` et le repli Piper utilisent `tempfile.mktemp()`, une fonction déconseillée car sujette aux conditions de course (un processus tiers peut créer le fichier avant l'écriture). Il est préférable d'utiliser `NamedTemporaryFile(delete=False)` ou `mkstemp()` pour obtenir un chemin réservé de manière atomique. 【F:jarvis.py†L516-L522】【F:jarvis.py†L701-L744】
+**Solution appliquée :**
+- `copy.deepcopy()` utilisé systématiquement dans `load_cfg()` (app.py:130, 133, 140)
+- Chaque chargement crée une copie complètement indépendante
+- Les valeurs par défaut restent intactes entre les sessions
 
-## Recommandations
+**Vérification :**
+```python
+# app.py:130
+cfg = copy.deepcopy(DEFAULT_CFG)
 
-- Cloner profondément (`copy.deepcopy`) `DEFAULT_CFG` avant toute mutation, ou reconstruire une nouvelle structure à partir des valeurs lues pour éviter de polluer les défauts.  
-- Fournir une valeur proxy MCP neutre (désactivée ou pointant vers un script inclus) et proposer des champs à remplir dans l'UI.  
-- Scinder les dépendances Piper en deux extras (`onnxruntime` **ou** `onnxruntime-gpu`) ou documenter clairement la marche à suivre selon le matériel.  
-- Remplacer `tempfile.mktemp()` par `NamedTemporaryFile(delete=False)` / `mkstemp()` et gérer la fermeture/suppression en conséquence.
+# app.py:133
+cfg[k] = {**cfg.get(k, {}), **copy.deepcopy(v)}
+
+# app.py:140
+cfg = copy.deepcopy(DEFAULT_CFG)
+```
+
+---
+
+### 2. ✅ Proxy MCP inexploitable - **RÉSOLU PAR MIGRATION**
+
+**Problème initial :**
+Configuration pointait vers un proxy MCP avec chemin absolu inexistant (`node /ABSOLU/adamwattis_mcp-proxy-server/build/index.js`).
+
+**Solution appliquée :**
+- Migration vers **Docker MCP Toolkit** (configuration `mcp.docker`)
+- Suppression complète des anciennes clés (`proxy`, `gateway`, `servers`, `jungle`)
+- Configuration Docker MCP activée par défaut avec commande `docker` standard
+- Fonction `_normalize_mcp_docker()` nettoie automatiquement les anciennes configs (app.py:103-122)
+
+**Configuration actuelle :**
+```python
+"mcp": {
+    "docker": {
+        "enabled": True,
+        "docker_cmd": "docker",
+        "auto_web": False,
+        "auto_web_topk": 5,
+        "chat_shortcuts": True
+    }
+}
+```
+
+---
+
+### 3. ✅ Conflit ONNX Runtime CPU/GPU - **RÉSOLU**
+
+**Problème initial :**
+`requirements.txt` listait à la fois `onnxruntime` (CPU) et `onnxruntime-gpu`, causant des conflits d'installation et des tentatives de chargement CUDA sur machines CPU uniquement.
+
+**Solution appliquée :**
+- Garde uniquement `onnxruntime==1.18.1` (CPU) dans requirements.txt
+- Architecture hybride documentée : Audio/STT/TTS sur CPU, LLM sur GPU via Ollama
+- Ollama gère sa propre pile CUDA indépendamment via llama.cpp
+- Commentaires clairs dans requirements.txt expliquant l'architecture
+
+**requirements.txt actuel :**
+```txt
+# Architecture Hybride CPU/GPU
+# - Audio/STT/TTS: CPU (onnxruntime CPU)
+# - LLM: GPU (Ollama gère CUDA indépendamment)
+
+onnxruntime==1.18.1  # CPU uniquement - Ollama gère son propre CUDA
+```
+
+**Note :** Pour GPU Piper (optionnel), utilisateur doit installer manuellement `onnxruntime-gpu` et remplacer la dépendance.
+
+---
+
+### 4. ✅ Fichiers temporaires non sécurisés - **RÉSOLU**
+
+**Problème initial :**
+Utilisation de `tempfile.mktemp()`, fonction dépréciée sujette aux conditions de course (race conditions).
+
+**Solution appliquée :**
+- Remplacement par `tempfile.NamedTemporaryFile(delete=False)` (jarvis.py:179)
+- Création atomique et sécurisée des fichiers temporaires
+- Fonction dédiée `_reserve_wav_path()` pour centraliser la logique
+
+**Code actuel (jarvis.py:177-184) :**
+```python
+def _reserve_wav_path(prefix: str) -> str:
+    """Return a unique temporary WAV path created atomically."""
+    tmp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".wav", delete=False)
+    try:
+        return tmp.name
+    finally:
+        tmp.close()
+```
+
+---
+
+## 🎯 État actuel du projet
+
+### Qualité du code
+- ✅ Aucun bug critique détecté
+- ✅ Gestion mémoire correcte (deep copy)
+- ✅ Sécurité des fichiers temporaires conforme aux bonnes pratiques
+- ✅ Dépendances cohérentes et documentées
+- ✅ Architecture hybride CPU/GPU bien séparée
+
+### Structure du projet
+```
+Streamlit_JARVIS/
+├── app.py                    # Interface Streamlit (1746 lignes)
+├── jarvis.py                 # Backend vocal (1256 lignes)
+├── jarvis_ui_style.py        # Style JARVIS HUD (692 lignes)
+├── requirements.txt          # Dépendances Python
+├── README.md                 # Documentation utilisateur
+├── CLAUDE.md                 # Instructions pour Claude Code
+├── ANALYSE.md               # Ce fichier
+└── scripts/
+    ├── install_dependencies.sh
+    ├── run_tests.sh
+    └── validate_gpu_setup.sh
+```
+
+### Tests de validation
+```bash
+# Compilation Python (syntaxe)
+python -m py_compile app.py jarvis.py jarvis_ui_style.py
+
+# Tests complets
+./scripts/run_tests.sh
+
+# Lancement
+streamlit run app.py
+```
+
+---
+
+## 📝 Recommandations futures
+
+### Améliorations potentielles (non critiques)
+
+1. **Tests unitaires**
+   - Ajouter des tests pour `load_cfg()` / `save_cfg()`
+   - Tester la normalisation MCP Docker
+   - Valider la gestion des erreurs
+
+2. **Documentation**
+   - Ajouter docstrings aux fonctions principales
+   - Documenter l'architecture MCP Docker
+   - Guide de migration GPU pour Piper (optionnel)
+
+3. **Logging**
+   - Centraliser les logs backend dans un fichier
+   - Rotation automatique des logs MCP
+   - Niveaux de verbosité configurables
+
+4. **Configuration**
+   - Validation de schéma JSON (jsonschema)
+   - Migration automatique entre versions de config
+   - Export/import de profils de configuration
+
+---
+
+## 🔍 Notes techniques
+
+### Architecture MCP
+- **Mode actuel :** Docker MCP Toolkit (via conteneurs Docker)
+- **Anciens modes supprimés :** Gateway HTTP/SSE, Proxy Node.js, serveurs stdio
+- **Compatibilité :** Docker requis pour les tools MCP
+
+### ONNX Runtime
+- **CPU par défaut :** Installation simple, compatible partout
+- **GPU optionnel :** Utilisateur avancé peut installer `onnxruntime-gpu` manuellement
+- **Ollama indépendant :** Gère CUDA séparément via llama.cpp (pas d'interférence)
+
+### Sécurité
+- Fichiers temporaires : création atomique via `NamedTemporaryFile`
+- Configuration : persistée dans `~/.jarvis/ui_config.json` (permissions utilisateur)
+- MCP auth : headers d'authentification stockés en clair (à chiffrer si sensible)
+
+---
+
+**Conclusion :** Le projet est dans un état stable et maintenable. Tous les problèmes critiques identifiés ont été corrigés avec succès.

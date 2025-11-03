@@ -11,12 +11,17 @@ import os, time, threading, queue, tempfile, sys, warnings, logging, shutil, sub
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 
-# --- Forcer CPU pour éviter OOM / chargements CUDA accidentels ---
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+# --- Configuration GPU/CPU ---
+# IMPORTANT: Ne PAS définir CUDA_VISIBLE_DEVICES ici pour permettre à Ollama d'utiliser le GPU
+# Architecture hybride:
+#   - Audio/STT/TTS: CPU (FW_DEVICE="cpu", PIPER_CUDA=0)
+#   - LLM (Ollama): GPU via llama.cpp (CUDA natif)
+# os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # ❌ DÉSACTIVÉ - bloquait Ollama GPU!
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+from scipy import signal as scipy_signal
 
 # --- Couper le bruit de fond des bibliothèques ---
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -55,15 +60,17 @@ FW_MODEL   = os.getenv("FW_MODEL", "small")
 FW_DEVICE  = os.getenv("FW_DEVICE", "cpu")
 FW_COMPUTE = os.getenv("FW_COMPUTE", "int8")
 
-# STT
+# STT - Paramètres optimisés pour précision
 FW_PROMPT     = os.getenv(
     "FW_PROMPT",
-    "Transcris strictement en français (fr). Noms propres: Jarvis, capitale, Paris, France, météo, heure, système.",
+    "Voici un enregistrement audio en français standard. Transcris exactement ce qui est dit, sans inventer ni modifier les mots. "
+    "Mots-clés courants: Jarvis, bonjour, merci, quelle heure, météo, température, système, fichier, recherche, internet, web, "
+    "documentation, code, Python, JavaScript, Docker, installer, lancer, arrêter, ouvrir, fermer, créer, supprimer."
 )
 FW_LANGUAGE   = os.getenv("FW_LANGUAGE", "fr").strip()
-FW_BEAM_WAKE  = int(os.getenv("FW_BEAM_WAKE", "1"))
-FW_BEAM_CMD   = int(os.getenv("FW_BEAM_CMD",  "1"))
-FW_VAD_CMD    = int(os.getenv("FW_VAD_CMD",   "0"))   # 0 = OFF (on coupe au silence micro)
+FW_BEAM_WAKE  = int(os.getenv("FW_BEAM_WAKE", "3"))  # Augmenté de 1 à 3 pour wake word
+FW_BEAM_CMD   = int(os.getenv("FW_BEAM_CMD",  "5"))  # Augmenté de 1 à 5 pour commandes complètes
+FW_VAD_CMD    = int(os.getenv("FW_VAD_CMD",   "1"))  # Activé (était 0) pour meilleure détection
 FW_VAD_WAKE   = int(os.getenv("FW_VAD_WAKE",  "1"))
 
 # Helpers bool env
@@ -589,9 +596,9 @@ def pick_devices_and_rates(prefer_output_name_substr: str | None = None):
 
     sd.default.samplerate = sr_in
     sd.default.channels   = 1
-    # Latence basse I/O
+    # Latence optimale (équilibre qualité/réactivité)
     sd.default.latency = ("low", "low")
-    sd.default.blocksize = 0  # 0 = min auto
+    sd.default.blocksize = 2048  # Optimal pour qualité audio stable
 
     print(f"[AUDIO] Input  : {in_idx} '{in_dev['name']}' @ {sr_in} Hz")
     print(f"[AUDIO] Output : {out_idx} '{out_dev['name']}' @ {sr_out} Hz")
@@ -676,6 +683,12 @@ def transcribe_path(
             initial_prompt=initial_prompt,
             vad_filter=use_vad,
             vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=250),
+            # Paramètres anti-hallucination
+            temperature=0.0,                    # Désactive le sampling aléatoire
+            condition_on_previous_text=True,    # Cohérence avec le contexte précédent
+            compression_ratio_threshold=2.4,    # Rejette les transcriptions trop compressées (répétitions)
+            log_prob_threshold=-1.0,            # Rejette les prédictions avec faible confiance
+            no_speech_threshold=0.6,            # Seuil pour détecter l'absence de parole
         )
         return "".join([s.text for s in segments]).strip()
     except ValueError as e:
@@ -685,14 +698,17 @@ def transcribe_path(
 
 # ===================== TTS =====================
 def _resample_linear(y: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
+    """Resampling haute qualité avec filtre anti-aliasing (scipy polyphase)."""
     if sr_from == sr_to or y.size == 0:
         return y
     n_to = int(round(y.size * sr_to / sr_from))
     if n_to <= 0:
         return y
-    xi = np.linspace(0.0, 1.0, num=n_to, endpoint=False, dtype=np.float64)
-    x  = np.linspace(0.0, 1.0, num=y.size, endpoint=False, dtype=np.float64)
-    return np.interp(xi, x, y.astype(np.float64)).astype(np.float32)
+
+    # Utiliser scipy.signal.resample avec filtre anti-aliasing automatique
+    # Plus haute qualité que l'interpolation linéaire, élimine les parasites
+    resampled = scipy_signal.resample(y, n_to)
+    return resampled.astype(np.float32)
 
 def _say_fallback(text: str, lang: str) -> bool:
     """Essaye espeak-ng / espeak / say (macOS). Retourne True si OK."""
@@ -808,6 +824,13 @@ class PiperTTS:
         if not text:
             return
         log(f"JARVIS: {text}")
+
+        # Prétraitement: ajouter une ponctuation pour les mots très courts sans ponctuation
+        # Cela aide Piper à générer des tenseurs de taille appropriée
+        text_to_speak = text.strip()
+        if len(text_to_speak) < 10 and not any(p in text_to_speak for p in '.!?,;:'):
+            text_to_speak = text_to_speak + "."
+
         # --output-raw (-f -) → flux PCM 16-bit mono sur stdout (officiel). Cf. docs/discussions Piper.  # :contentReference[oaicite:2]{index=2}
         args = [
             self.exe, "-m", self.voice,
@@ -825,23 +848,55 @@ class PiperTTS:
             args += ["--cuda"]
 
         try:
-            proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            # Capturer stderr pour éviter que les erreurs ONNX polluent la sortie
+            proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             try:
-                proc.stdin.write(text.encode("utf-8") + b"\n")
+                proc.stdin.write(text_to_speak.encode("utf-8") + b"\n")
                 proc.stdin.close()
             except Exception:
                 pass
             vu_level = 0.0
             log_vu(0.0)
 
+            # Détecter le sample rate de sortie réel
+            out_dev = sd.query_devices(sd.default.device[1], kind='output')
+            output_sr = int(out_dev.get('default_samplerate', 44100))
+            need_resample = (output_sr != self.sample_rate)
+
+            if need_resample:
+                log(f"[TTS] Resampling {self.sample_rate}Hz → {output_sr}Hz (carte audio)")
+
             with sd.RawOutputStream(
-                samplerate=self.sample_rate, channels=1, dtype="int16",
-                blocksize=0, dither_off=True
+                samplerate=output_sr, channels=1, dtype="int16",
+                blocksize=2048, dither_off=False
             ) as stream:
                 while True:
-                    chunk = proc.stdout.read(4096)
+                    chunk = proc.stdout.read(16384)
                     if not chunk:
                         break
+
+                    # Resample si nécessaire
+                    if need_resample and len(chunk) >= 2:
+                        try:
+                            samples = np.frombuffer(chunk, dtype=np.int16)
+                            if samples.size > 0:
+                                # Resampling haute qualité avec scipy polyphase filter
+                                resampled = _resample_linear(samples.astype(np.float32),
+                                                             self.sample_rate, output_sr)
+
+                                # Normalisation douce pour éviter le clipping
+                                peak = np.abs(resampled).max()
+                                if peak > 28000:
+                                    resampled = resampled * (28000.0 / peak)
+
+                                # Soft clipping avec tanh au lieu de hard clip
+                                resampled = np.tanh(resampled / 32768.0) * 32768.0
+
+                                chunk = resampled.astype(np.int16).tobytes()
+                        except Exception as e:
+                            log(f"[TTS] Erreur resample: {e}")
+                            continue
+
                     stream.write(chunk)
                     if len(chunk) < 2:
                         continue
@@ -875,7 +930,7 @@ class PiperTTS:
                     fallback_args += ["--cuda"]
                 subprocess.run(
                     fallback_args,
-                    input=text.encode("utf-8"), check=False
+                    input=text_to_speak.encode("utf-8"), check=False, stderr=subprocess.DEVNULL
                 )
                 y, sr = sf.read(tmp, dtype="float32", always_2d=False)
                 sd.play(y, sr, blocking=True)
@@ -891,6 +946,36 @@ class PiperTTS:
 
 # ===================== LLM via OLLAMA =====================
 ollama_client = None  # global
+
+def check_ollama_gpu() -> bool:
+    """Vérifie qu'Ollama utilise bien le GPU NVIDIA."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0 and "ollama" in result.stdout.lower():
+            log("[LLM] ✅ Ollama détecté sur GPU (nvidia-smi)")
+            # Extraire la mémoire GPU utilisée
+            for line in result.stdout.strip().split('\n'):
+                if 'ollama' in line.lower():
+                    log(f"[LLM]    {line.strip()}")
+            return True
+        else:
+            log("[LLM] ⚠️ Ollama non détecté sur GPU. Vérifications:")
+            log("[LLM]    1. Ollama est-il démarré? (ollama serve)")
+            log("[LLM]    2. CUDA_VISIBLE_DEVICES est-il vide/absent?")
+            log("[LLM]    3. 'nvidia-smi' montre-t-il des processus?")
+            return False
+    except FileNotFoundError:
+        log("[LLM] ⚠️ nvidia-smi non trouvé (pilotes NVIDIA manquants ou pas de GPU)")
+        return False
+    except subprocess.TimeoutExpired:
+        log("[LLM] ⚠️ nvidia-smi timeout")
+        return False
+    except Exception as e:
+        log(f"[LLM] Erreur vérification GPU: {e}")
+        return False
 
 def init_llm():
     global ollama_client
@@ -960,13 +1045,17 @@ def generate_stream(question: str, manager: Optional[MCPToolManager] = None, web
         if manager and manager.has_tools():
             yield generate_full(question, manager, web_context=web_context)
             return
+
         for chunk in ollama_client.chat(
             model=LLM_ID,
             messages=_ollama_messages(question, web_context=web_context),
             stream=True,
             options=_ollama_options(),
         ):
-            yield (chunk.get("message", {}) or {}).get("content", "") or ""
+            text = (chunk.get("message", {}) or {}).get("content", "") or ""
+            if text:
+                yield text
+
     except Exception as e:
         log(f"[LLM] Erreur Ollama (stream): {e}")
         yield ""
@@ -1137,6 +1226,10 @@ def main():
         tts = TTS(lang_id=TTS_LANG)
 
     tok, mdl = init_llm()
+
+    # Vérifier que Ollama utilise bien le GPU
+    check_ollama_gpu()
+
     global MCP_MANAGER
     configs = load_mcp_configs()
     if configs:
